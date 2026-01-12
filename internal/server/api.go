@@ -4607,7 +4607,7 @@ func (s *Server) handleAPIHAProxyConfig(w http.ResponseWriter, r *http.Request) 
 		zones = s.config.ExternalDNS.Zones
 	}
 
-	configStr := s.haproxy.GenerateConfig(services, zones)
+	configStr := s.haproxy.GenerateConfig(services, zones, s.config.LANAddresses)
 
 	writeJSON(w, map[string]interface{}{
 		"config": configStr,

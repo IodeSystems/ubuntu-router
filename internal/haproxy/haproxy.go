@@ -67,7 +67,8 @@ func New(fs system.FileSystem, runner system.CommandRunner, certDir string) *Man
 }
 
 // WriteConfig generates and writes HAProxy configuration from services
-func (m *Manager) WriteConfig(services []config.Service, zones []config.ExternalDNSZone) error {
+// lanAddresses is used to add an admin UI backend for the gateway IP
+func (m *Manager) WriteConfig(services []config.Service, zones []config.ExternalDNSZone, lanAddresses []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -143,12 +144,25 @@ func (m *Manager) WriteConfig(services []config.Service, zones []config.External
 		}
 	}
 
+	// Add admin UI backend for the gateway IP
+	// This allows access to the admin UI on port 80 from the LAN
+	if len(lanAddresses) > 0 {
+		lanIP := strings.Split(lanAddresses[0], "/")[0]
+		backends = append(backends, Backend{
+			Name:        "admin_ui",
+			DomainMatch: lanIP, // Match requests to the gateway IP
+			Server:      lanIP + ":8080",
+			HTTPCheck:   false,
+			Mode:        "http",
+		})
+	}
+
 	cfg := m.generateConfig(backends, 80, 443)
 	return m.fs.WriteFile(m.configPath, []byte(cfg), 0644)
 }
 
 // GenerateConfig returns the HAProxy configuration as a string (for preview)
-func (m *Manager) GenerateConfig(services []config.Service, zones []config.ExternalDNSZone) string {
+func (m *Manager) GenerateConfig(services []config.Service, zones []config.ExternalDNSZone, lanAddresses []string) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -196,6 +210,18 @@ func (m *Manager) GenerateConfig(services []config.Service, zones []config.Exter
 			HTTPCheck:   svc.Proxy.HealthCheck != "",
 			CheckPath:   svc.Proxy.HealthCheck,
 			Mode:        mode,
+		})
+	}
+
+	// Add admin UI backend for the gateway IP
+	if len(lanAddresses) > 0 {
+		lanIP := strings.Split(lanAddresses[0], "/")[0]
+		backends = append(backends, Backend{
+			Name:        "admin_ui",
+			DomainMatch: lanIP,
+			Server:      lanIP + ":8080",
+			HTTPCheck:   false,
+			Mode:        "http",
 		})
 	}
 

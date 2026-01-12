@@ -305,16 +305,28 @@ func (s *Server) Run() error {
 	// Set up routes
 	mux := s.setupRoutes()
 
+	// Determine listen address
+	// If ListenAddr is just a port (e.g., ":8080"), bind to LAN IP for security
+	// This prevents the admin UI from being accessible from the WAN interface
+	listenAddr := s.config.ListenAddr
+	if strings.HasPrefix(listenAddr, ":") && len(s.config.LANAddresses) > 0 {
+		// Extract IP from CIDR (e.g., "192.168.2.1/24" -> "192.168.2.1")
+		lanIP := strings.Split(s.config.LANAddresses[0], "/")[0]
+		port := listenAddr // ":8080"
+		listenAddr = lanIP + port
+		log.Printf("Binding to LAN interface %s for security", listenAddr)
+	}
+
 	// Create HTTP server
 	server := &http.Server{
-		Addr:         s.config.ListenAddr,
+		Addr:         listenAddr,
 		Handler:      s.loggingMiddleware(mux),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Printf("Starting server on %s", s.config.ListenAddr)
+	log.Printf("Starting server on %s", listenAddr)
 	return server.ListenAndServe()
 }
 

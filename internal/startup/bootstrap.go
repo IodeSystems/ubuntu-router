@@ -5,9 +5,14 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/iodesystems/ubuntu-router/internal/config"
+	"github.com/iodesystems/ubuntu-router/internal/dnsmasq"
+	"github.com/iodesystems/ubuntu-router/internal/haproxy"
+	"github.com/iodesystems/ubuntu-router/internal/multiwan"
 	"github.com/iodesystems/ubuntu-router/internal/system"
+	"github.com/iodesystems/ubuntu-router/internal/wifi"
 	"github.com/iodesystems/ubuntu-router/internal/wireguard"
 )
 
@@ -19,6 +24,10 @@ type Bootstrap struct {
 	config       *config.Config
 	services     *system.ServiceManager
 	wireguardP2P *wireguard.P2PManager
+	dns          *dnsmasq.Manager
+	wifi         *wifi.Manager
+	haproxy      *haproxy.Manager
+	multiwan     *multiwan.Manager
 }
 
 // New creates a new Bootstrap instance
@@ -29,6 +38,10 @@ func New(runner system.CommandRunner, fs system.FileSystem, cfg *config.Config, 
 		config:       cfg,
 		services:     system.NewServiceManager(runner),
 		wireguardP2P: wireguardP2P,
+		dns:          dnsmasq.New(fs, runner, cfg.DNSConfigPath, cfg.DHCPConfigPath, cfg.DNSHostsPath),
+		wifi:         wifi.New(fs, runner),
+		haproxy:      haproxy.New(fs, runner, "/etc/ubuntu-router/certs"),
+		multiwan:     multiwan.New(runner, fs),
 	}
 }
 
@@ -48,19 +61,47 @@ func (b *Bootstrap) Run(ctx context.Context) error {
 		errors = append(errors, fmt.Sprintf("WireGuard module: %v", err))
 	}
 
-	// 3. Apply NAT masquerade rules
+	// 3. Configure WiFi WAN in background (can take 30+ seconds for WPA3)
+	// This runs asynchronously so the server starts while WiFi is connecting
+	go func() {
+		if err := b.configureWiFiWAN(ctx); err != nil {
+			log.Printf("WiFi WAN warning: %v", err)
+		}
+	}()
+
+	// 4. Apply NAT masquerade rules
 	if err := b.applyNATRules(ctx); err != nil {
 		errors = append(errors, fmt.Sprintf("NAT rules: %v", err))
 	}
 
-	// 4. Configure LAN bridge (bring up, add IP)
+	// 5. Configure LAN bridge (bring up, add IP)
 	if err := b.configureLANBridge(ctx); err != nil {
 		errors = append(errors, fmt.Sprintf("LAN bridge: %v", err))
 	}
 
-	// 5. Start WireGuard interfaces and enable auto-start
+	// 6. Configure dnsmasq (DNS/DHCP) so clients can get IP addresses
+	if err := b.configureDNSMasq(ctx); err != nil {
+		errors = append(errors, fmt.Sprintf("dnsmasq: %v", err))
+	}
+
+	// 7. Configure WiFi access points (hostapd)
+	if err := b.configureWiFi(ctx); err != nil {
+		errors = append(errors, fmt.Sprintf("WiFi: %v", err))
+	}
+
+	// 8. Start WireGuard interfaces and enable auto-start
 	if err := b.startWireGuardInterfaces(ctx); err != nil {
 		errors = append(errors, fmt.Sprintf("WireGuard interfaces: %v", err))
+	}
+
+	// 9. Configure HAProxy (for admin UI access on port 80)
+	if err := b.configureHAProxy(ctx); err != nil {
+		errors = append(errors, fmt.Sprintf("HAProxy: %v", err))
+	}
+
+	// 10. Start WAN health monitoring with auto-failover
+	if err := b.startWANMonitoring(ctx); err != nil {
+		errors = append(errors, fmt.Sprintf("WAN monitoring: %v", err))
 	}
 
 	if len(errors) > 0 {
@@ -131,6 +172,157 @@ func (b *Bootstrap) loadWireGuardModule(ctx context.Context) error {
 	return nil
 }
 
+// configureWiFiWAN connects to a WiFi network for WAN uplink when wan_mode is "wifi"
+func (b *Bootstrap) configureWiFiWAN(ctx context.Context) error {
+	if b.config.WANMode != "wifi" {
+		log.Println("  Skipping WiFi WAN (wan_mode is not wifi)")
+		return nil
+	}
+
+	if b.config.WANInterface == "" || b.config.WANWiFiSSID == "" {
+		log.Println("  Skipping WiFi WAN (no interface or SSID configured)")
+		return nil
+	}
+
+	iface := b.config.WANInterface
+	ssid := b.config.WANWiFiSSID
+	password := b.config.WANWiFiPassword
+	security := b.config.WANWiFiSecurity
+	if security == "" {
+		security = "wpa2"
+	}
+
+	log.Printf("  Configuring WiFi WAN on %s (SSID: %s)...", iface, ssid)
+
+	// Generate wpa_supplicant config
+	configPath := fmt.Sprintf("/etc/wpa_supplicant/wpa_supplicant-%s.conf", iface)
+
+	if err := b.fs.MkdirAll("/etc/wpa_supplicant", 0755); err != nil {
+		return fmt.Errorf("failed to create wpa_supplicant directory: %w", err)
+	}
+
+	config := b.generateWpaSupplicantConfig(ssid, password, security)
+	if err := b.fs.WriteFile(configPath, []byte(config), 0600); err != nil {
+		return fmt.Errorf("failed to write wpa_supplicant config: %w", err)
+	}
+
+	// Write systemd service for wpa_supplicant
+	servicePath := fmt.Sprintf("/etc/systemd/system/wpa_supplicant-%s.service", iface)
+	service := fmt.Sprintf(`[Unit]
+Description=WPA supplicant for %s (WiFi WAN)
+Before=network.target
+Wants=network.target
+After=dbus.service
+
+[Service]
+Type=simple
+ExecStart=/sbin/wpa_supplicant -c %s -i %s
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`, iface, configPath, iface)
+
+	if err := b.fs.WriteFile(servicePath, []byte(service), 0644); err != nil {
+		return fmt.Errorf("failed to write wpa_supplicant service: %w", err)
+	}
+
+	// Reload systemd
+	b.runner.Run(ctx, "systemctl", "daemon-reload")
+
+	// Enable and start wpa_supplicant
+	svcName := "wpa_supplicant-" + iface
+	if err := b.services.Enable(ctx, svcName); err != nil {
+		log.Printf("  Warning: failed to enable wpa_supplicant: %v", err)
+	}
+	if err := b.services.Restart(ctx, svcName); err != nil {
+		return fmt.Errorf("failed to start wpa_supplicant: %w", err)
+	}
+
+	// Give wpa_supplicant time to create the control socket
+	time.Sleep(2 * time.Second)
+
+	// Wait for WiFi connection (up to 45 seconds for WPA3/SAE which can be slow)
+	log.Printf("  Waiting for WiFi connection to %s...", ssid)
+	connected := false
+	for i := 0; i < 45; i++ {
+		time.Sleep(1 * time.Second)
+		// Use timeout command to prevent wpa_cli from hanging if socket isn't ready
+		out, err := b.runner.Run(ctx, "timeout", "3", "wpa_cli", "-i", iface, "status")
+		if err == nil && strings.Contains(string(out), "wpa_state=COMPLETED") {
+			connected = true
+			log.Printf("  WiFi connected after %d seconds", i+1)
+			break
+		}
+	}
+
+	if !connected {
+		return fmt.Errorf("failed to connect to WiFi network %s", ssid)
+	}
+	log.Printf("  WiFi connected to %s", ssid)
+
+	// Request DHCP on the WiFi WAN interface
+	log.Printf("  Requesting DHCP on %s...", iface)
+
+	// Check which DHCP client is available and use it
+	var dhcpErr error
+	if _, err := b.runner.Run(ctx, "which", "dhclient"); err == nil {
+		_, dhcpErr = b.runner.Run(ctx, "dhclient", "-v", iface)
+	} else if _, err := b.runner.Run(ctx, "which", "dhcpcd"); err == nil {
+		_, dhcpErr = b.runner.Run(ctx, "dhcpcd", "-4", iface)
+	} else {
+		return fmt.Errorf("no DHCP client found (dhclient or dhcpcd)")
+	}
+	if dhcpErr != nil {
+		return fmt.Errorf("DHCP request failed on WiFi WAN: %w", dhcpErr)
+	}
+
+	// Verify we got an IP
+	out, _ := b.runner.Run(ctx, "ip", "-4", "addr", "show", iface)
+	if !strings.Contains(string(out), "inet ") {
+		return fmt.Errorf("WiFi WAN did not get an IP address")
+	}
+
+	log.Printf("  WiFi WAN configured on %s", iface)
+	return nil
+}
+
+// generateWpaSupplicantConfig creates wpa_supplicant configuration for WiFi WAN
+func (b *Bootstrap) generateWpaSupplicantConfig(ssid, password, security string) string {
+	var sb strings.Builder
+
+	sb.WriteString("# Ubuntu Router wpa_supplicant configuration\n")
+	sb.WriteString("# Auto-generated - do not edit\n\n")
+	sb.WriteString("ctrl_interface=/var/run/wpa_supplicant\n")
+	sb.WriteString("ctrl_interface_group=0\n")
+	sb.WriteString("update_config=1\n\n")
+
+	sb.WriteString("network={\n")
+	sb.WriteString(fmt.Sprintf("\tssid=\"%s\"\n", ssid))
+
+	switch security {
+	case "open":
+		sb.WriteString("\tkey_mgmt=NONE\n")
+	case "wep":
+		sb.WriteString("\tkey_mgmt=NONE\n")
+		sb.WriteString(fmt.Sprintf("\twep_key0=\"%s\"\n", password))
+		sb.WriteString("\twep_tx_keyidx=0\n")
+	case "wpa3":
+		sb.WriteString(fmt.Sprintf("\tpsk=\"%s\"\n", password))
+		sb.WriteString("\tkey_mgmt=SAE\n")
+		sb.WriteString("\tieee80211w=2\n")
+	default: // wpa, wpa2
+		sb.WriteString(fmt.Sprintf("\tpsk=\"%s\"\n", password))
+		sb.WriteString("\tkey_mgmt=WPA-PSK\n")
+	}
+
+	sb.WriteString("\tscan_ssid=1\n")
+	sb.WriteString("}\n")
+
+	return sb.String()
+}
+
 // configureLANBridge creates (if needed), brings up the LAN bridge and adds configured IP addresses
 func (b *Bootstrap) configureLANBridge(ctx context.Context) error {
 	if b.config.LANBridge == "" {
@@ -191,29 +383,196 @@ func (b *Bootstrap) configureLANBridge(ctx context.Context) error {
 	return nil
 }
 
-// applyNATRules applies NAT masquerade rules for the WAN interface
-func (b *Bootstrap) applyNATRules(ctx context.Context) error {
-	if b.config.WANInterface == "" {
-		log.Println("  Skipping NAT rules (no WAN interface configured)")
+// configureDNSMasq writes dnsmasq config files and restarts the service.
+// This ensures DHCP and DNS are available to LAN clients immediately on boot,
+// without requiring WAN connectivity or manual intervention.
+func (b *Bootstrap) configureDNSMasq(ctx context.Context) error {
+	if !b.config.DNSEnabled && !b.config.DHCPEnabled {
+		log.Println("  Skipping dnsmasq (DNS and DHCP both disabled)")
 		return nil
 	}
 
-	log.Printf("  Applying NAT rules for WAN interface %s...", b.config.WANInterface)
+	log.Println("  Configuring dnsmasq (DNS/DHCP)...")
+
+	// Write DNS and DHCP config files
+	if err := b.dns.WriteConfig(b.config); err != nil {
+		return fmt.Errorf("failed to write dnsmasq config: %w", err)
+	}
+	log.Println("  dnsmasq config files written")
+
+	// Write custom hosts file for DNS entries
+	if err := b.dns.WriteHosts(b.config.DNSEntries); err != nil {
+		log.Printf("  Warning: failed to write DNS hosts file: %v", err)
+		// Not fatal - continue
+	}
+
+	// Enable dnsmasq to start on boot
+	if err := b.dns.Enable(ctx); err != nil {
+		log.Printf("  Warning: failed to enable dnsmasq on boot: %v", err)
+	}
+
+	// Restart dnsmasq to apply the config
+	if err := b.dns.Restart(ctx); err != nil {
+		return fmt.Errorf("failed to restart dnsmasq: %w", err)
+	}
+
+	log.Println("  dnsmasq configured and restarted")
+	return nil
+}
+
+// configureWiFi writes hostapd config files and starts the WiFi access points.
+// This ensures WiFi APs are available to clients immediately on boot.
+func (b *Bootstrap) configureWiFi(ctx context.Context) error {
+	if len(b.config.WiFiInterfaces) == 0 {
+		log.Println("  Skipping WiFi (no interfaces configured)")
+		return nil
+	}
+
+	log.Println("  Configuring WiFi access points...")
+
+	for i := range b.config.WiFiInterfaces {
+		wifiCfg := &b.config.WiFiInterfaces[i]
+		if !wifiCfg.Enabled {
+			log.Printf("  WiFi %s: disabled, skipping", wifiCfg.Interface)
+			continue
+		}
+
+		log.Printf("  WiFi %s: configuring hostapd (SSID: %s)...", wifiCfg.Interface, wifiCfg.SSID)
+
+		// ConfigureInterface writes config, creates systemd service, enables and starts
+		if err := b.wifi.ConfigureInterface(ctx, wifiCfg); err != nil {
+			log.Printf("  Warning: failed to configure WiFi %s: %v", wifiCfg.Interface, err)
+			// Continue with other interfaces
+			continue
+		}
+
+		// hostapd is supposed to add the interface to the bridge when configured with bridge=X,
+		// but this doesn't always work reliably. Explicitly add the interface to the bridge
+		// after hostapd starts to ensure WiFi clients can communicate with the LAN.
+		if wifiCfg.Mode == "bridge" && wifiCfg.Bridge != "" {
+			log.Printf("  WiFi %s: ensuring interface is in bridge %s...", wifiCfg.Interface, wifiCfg.Bridge)
+			// Give hostapd a moment to initialize
+			time.Sleep(500 * time.Millisecond)
+			// Add interface to bridge explicitly
+			if _, err := b.runner.Run(ctx, "ip", "link", "set", wifiCfg.Interface, "master", wifiCfg.Bridge); err != nil {
+				log.Printf("  Warning: failed to add %s to bridge %s: %v", wifiCfg.Interface, wifiCfg.Bridge, err)
+			} else {
+				log.Printf("  WiFi %s: added to bridge %s", wifiCfg.Interface, wifiCfg.Bridge)
+			}
+		}
+
+		log.Printf("  WiFi %s: hostapd configured and started", wifiCfg.Interface)
+	}
+
+	log.Println("  WiFi access points configured")
+	return nil
+}
+
+// applyNATRules applies NAT masquerade rules for the WAN interface
+// It detects an available WAN if the configured one isn't working
+func (b *Bootstrap) applyNATRules(ctx context.Context) error {
+	// Detect the best available WAN interface
+	wanInterface := b.detectActiveWAN(ctx)
+	if wanInterface == "" {
+		log.Println("  Skipping NAT rules (no WAN interface available)")
+		return nil
+	}
+
+	log.Printf("  Applying NAT rules for WAN interface %s...", wanInterface)
 
 	// Check if rule already exists
 	out, _ := b.runner.Run(ctx, "iptables", "-t", "nat", "-L", "POSTROUTING", "-n", "-v")
-	if strings.Contains(string(out), b.config.WANInterface) && strings.Contains(string(out), "MASQUERADE") {
+	if strings.Contains(string(out), wanInterface) && strings.Contains(string(out), "MASQUERADE") {
 		log.Println("  NAT masquerade rule already exists")
 		return nil
 	}
 
 	// Add masquerade rule
-	if _, err := b.runner.Run(ctx, "iptables", "-t", "nat", "-A", "POSTROUTING", "-o", b.config.WANInterface, "-j", "MASQUERADE"); err != nil {
+	if _, err := b.runner.Run(ctx, "iptables", "-t", "nat", "-A", "POSTROUTING", "-o", wanInterface, "-j", "MASQUERADE"); err != nil {
 		return fmt.Errorf("failed to add NAT masquerade rule: %w", err)
 	}
 
-	log.Printf("  NAT masquerade configured for %s", b.config.WANInterface)
+	log.Printf("  NAT masquerade configured for %s", wanInterface)
 	return nil
+}
+
+// detectActiveWAN finds the best available WAN interface
+// Priority: configured WAN if up, then any interface with internet connectivity
+func (b *Bootstrap) detectActiveWAN(ctx context.Context) string {
+	// First, check if the configured WAN is up and has an IP
+	if b.config.WANInterface != "" {
+		if b.isInterfaceUp(ctx, b.config.WANInterface) {
+			log.Printf("  Configured WAN %s is up", b.config.WANInterface)
+			return b.config.WANInterface
+		}
+		log.Printf("  Configured WAN %s is not available, looking for alternatives...", b.config.WANInterface)
+	}
+
+	// Check multi-WAN interfaces if configured
+	if b.config.MultiWAN != nil && b.config.MultiWAN.Enabled {
+		for _, wan := range b.config.MultiWAN.WANs {
+			if wan.Enabled && b.isInterfaceUp(ctx, wan.Interface) {
+				log.Printf("  Multi-WAN interface %s is up", wan.Interface)
+				return wan.Interface
+			}
+		}
+	}
+
+	// Fallback: scan for any interface with an IP and default route
+	// Skip bridge, loopback, wireguard, and known LAN interfaces
+	lanBridge := b.config.LANBridge
+	out, err := b.runner.Run(ctx, "ip", "-4", "route", "show", "default")
+	if err == nil && len(out) > 0 {
+		// Parse default route to find WAN interface
+		// Format: default via X.X.X.X dev <interface>
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "default via") {
+				parts := strings.Fields(line)
+				for i, part := range parts {
+					if part == "dev" && i+1 < len(parts) {
+						iface := parts[i+1]
+						// Skip LAN bridge and loopback
+						if iface != lanBridge && iface != "lo" && !strings.HasPrefix(iface, "wg") {
+							log.Printf("  Fallback WAN detected: %s", iface)
+							return iface
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Last resort: look for any ethernet interface with an IP
+	out, _ = b.runner.Run(ctx, "ip", "-4", "addr", "show")
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "inet ") && !strings.Contains(line, "127.0.0.1") {
+			// Find interface from previous line or context
+			// This is a simplified fallback
+		}
+	}
+
+	return ""
+}
+
+// isInterfaceUp checks if an interface is up and has an IP address
+func (b *Bootstrap) isInterfaceUp(ctx context.Context, iface string) bool {
+	// Check link state
+	out, err := b.runner.Run(ctx, "ip", "link", "show", iface)
+	if err != nil {
+		return false
+	}
+	if !strings.Contains(string(out), "state UP") {
+		return false
+	}
+
+	// Check for IP address
+	out, err = b.runner.Run(ctx, "ip", "-4", "addr", "show", iface)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "inet ")
 }
 
 // startWireGuardInterfaces enables auto-start for configured WireGuard interfaces via systemd.
@@ -314,4 +673,163 @@ func (b *Bootstrap) enableWireGuardAutoStart(ctx context.Context, iface string) 
 		return false
 	}
 	return true
+}
+
+// configureHAProxy writes HAProxy config and starts the service.
+// This ensures the admin UI is accessible on port 80 via the gateway IP.
+func (b *Bootstrap) configureHAProxy(ctx context.Context) error {
+	// Check if HAProxy is installed
+	if !haproxy.Available(b.runner) {
+		log.Println("  Skipping HAProxy (not installed)")
+		return nil
+	}
+
+	log.Println("  Configuring HAProxy...")
+
+	// Get services and zones from config
+	var services []config.Service
+	var zones []config.ExternalDNSZone
+	if b.config.Services != nil {
+		services = b.config.Services.Services
+	}
+	if b.config.ExternalDNS != nil {
+		zones = b.config.ExternalDNS.Zones
+	}
+
+	// Write HAProxy config (includes admin_ui backend for gateway IP)
+	if err := b.haproxy.WriteConfig(services, zones, b.config.LANAddresses); err != nil {
+		return fmt.Errorf("failed to write HAProxy config: %w", err)
+	}
+
+	// Enable HAProxy on boot
+	if err := b.haproxy.Enable(ctx); err != nil {
+		log.Printf("  Warning: failed to enable HAProxy on boot: %v", err)
+	}
+
+	// Restart HAProxy to apply config
+	if err := b.haproxy.Restart(ctx); err != nil {
+		return fmt.Errorf("failed to restart HAProxy: %w", err)
+	}
+
+	log.Println("  HAProxy configured and restarted")
+	return nil
+}
+
+// startWANMonitoring starts the multi-WAN health monitoring with auto-failover.
+// If multi-WAN isn't explicitly configured, it auto-detects available WAN interfaces.
+func (b *Bootstrap) startWANMonitoring(ctx context.Context) error {
+	log.Println("  Starting WAN health monitoring...")
+
+	// Build multi-WAN config, either from explicit config or auto-detected
+	var wanConfig *config.MultiWANConfig
+
+	if b.config.MultiWAN != nil && b.config.MultiWAN.Enabled {
+		// Use explicit multi-WAN configuration
+		wanConfig = b.config.MultiWAN
+		log.Printf("  Using configured multi-WAN with %d interfaces", len(wanConfig.WANs))
+	} else {
+		// Auto-detect WAN interfaces
+		wanConfig = b.autoDetectWANs(ctx)
+		if wanConfig == nil || len(wanConfig.WANs) == 0 {
+			log.Println("  No WAN interfaces detected, skipping monitoring")
+			return nil
+		}
+		log.Printf("  Auto-detected %d WAN interfaces", len(wanConfig.WANs))
+	}
+
+	// Configure and start the multi-WAN manager
+	b.multiwan.Configure(wanConfig)
+	if err := b.multiwan.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start WAN monitoring: %w", err)
+	}
+
+	log.Println("  WAN health monitoring started")
+	return nil
+}
+
+// autoDetectWANs scans for available WAN interfaces and creates a multi-WAN config
+func (b *Bootstrap) autoDetectWANs(ctx context.Context) *config.MultiWANConfig {
+	var wans []config.WANConfig
+	priority := 1
+
+	// Get all interfaces with default routes
+	out, err := b.runner.Run(ctx, "ip", "-4", "route", "show", "default")
+	if err != nil {
+		return nil
+	}
+
+	// Track seen interfaces to avoid duplicates
+	seen := make(map[string]bool)
+
+	// Parse default routes: default via X.X.X.X dev <interface>
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "default via") {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		var iface string
+		for i, part := range parts {
+			if part == "dev" && i+1 < len(parts) {
+				iface = parts[i+1]
+				break
+			}
+		}
+
+		if iface == "" {
+			continue
+		}
+
+		// Skip bridge, loopback, and wireguard interfaces
+		if iface == b.config.LANBridge || iface == "lo" || strings.HasPrefix(iface, "wg") {
+			continue
+		}
+
+		// Skip already seen
+		if seen[iface] {
+			continue
+		}
+		seen[iface] = true
+
+		// Add this interface as a WAN
+		wans = append(wans, config.WANConfig{
+			Name:                 "Auto-" + iface,
+			Interface:            iface,
+			Enabled:              true,
+			Priority:             priority,
+			HealthCheckInterval:  10,
+			HealthCheckTimeout:   5,
+			HealthCheckRetries:   3,
+			HealthCheckTargets:   []string{"8.8.8.8", "1.1.1.1"},
+		})
+		priority++
+		log.Printf("  Auto-detected WAN: %s (priority %d)", iface, priority-1)
+	}
+
+	// Also add the configured WAN interface if not already detected
+	if b.config.WANInterface != "" && !seen[b.config.WANInterface] {
+		wans = append(wans, config.WANConfig{
+			Name:                 "Configured-" + b.config.WANInterface,
+			Interface:            b.config.WANInterface,
+			Enabled:              true,
+			Priority:             priority,
+			HealthCheckInterval:  10,
+			HealthCheckTimeout:   5,
+			HealthCheckRetries:   3,
+			HealthCheckTargets:   []string{"8.8.8.8", "1.1.1.1"},
+		})
+		log.Printf("  Added configured WAN: %s (priority %d)", b.config.WANInterface, priority)
+	}
+
+	if len(wans) == 0 {
+		return nil
+	}
+
+	return &config.MultiWANConfig{
+		Enabled:       true,
+		Mode:          "failover",
+		WANs:          wans,
+		FailbackDelay: 60, // Wait 60 seconds before switching back to higher priority WAN
+	}
 }

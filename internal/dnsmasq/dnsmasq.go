@@ -135,6 +135,10 @@ func (m *Manager) WriteDHCPConfig(cfg *config.Config) error {
 		sb.WriteString("# DHCP settings\n")
 		sb.WriteString(fmt.Sprintf("dhcp-range=%s,%s,%s\n", cfg.DHCPStart, cfg.DHCPEnd, cfg.DHCPLease))
 
+		// Force broadcast for DHCP responses - required for some clients (macOS)
+		// that can't receive unicast before having an IP address
+		sb.WriteString("dhcp-broadcast\n")
+
 		// Set router and DNS for DHCP clients
 		if len(cfg.LANAddresses) > 0 {
 			// Extract IP from CIDR

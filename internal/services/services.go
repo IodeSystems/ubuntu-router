@@ -406,7 +406,7 @@ func (m *Manager) syncInternal(ctx context.Context) error {
 	// Write HAProxy config
 	zones := m.GetZones()
 	services := m.getServices()
-	if err := m.haproxy.WriteConfig(services, zones); err != nil {
+	if err := m.haproxy.WriteConfig(services, zones, m.cfg.LANAddresses); err != nil {
 		return fmt.Errorf("failed to write HAProxy config: %w", err)
 	}
 
