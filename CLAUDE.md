@@ -62,7 +62,8 @@ make vm-destroy     # Delete the VM
 **Frontend (React 19 + TypeScript)** in `web/`:
 - Vite build, Material-UI, TanStack Router
 - API client in `web/src/api/client.ts` with 80+ methods
-- Route-based pages in `web/src/routes/`: dashboard, interfaces, wan, dns, dhcp, wifi, wireguard, wireguard-p2p, firewall, multiwan, external-dns, settings, setup
+- WebSocket log streaming in `web/src/api/websocket.ts`
+- Route-based pages in `web/src/routes/`: dashboard, interfaces, wan (includes multi-WAN), dns, dhcp, wifi, wireguard, wireguard-p2p, firewall, external-dns, settings, setup
 
 ## Key Patterns
 
@@ -153,17 +154,17 @@ All endpoints under `/api/` with session-cookie authentication:
 ## Frontend Structure
 
 **TanStack Router file-based routing** in `web/src/routes/`:
-- `__root.tsx` - Layout with sidebar navigation
-- `index.tsx` - Dashboard with status cards
+- `__root.tsx` - Layout with sidebar navigation and debug log modal
+- `index.tsx` - Dashboard with status cards, WiFi clients, device tracking
 - `interfaces.tsx` - Network interface management
-- `wan.tsx` - WAN configuration with mode selection
+- `wan.tsx` - WAN configuration with multi-WAN failover status
 - `dns.tsx` - DNS server and entries
-- `dhcp.tsx` - DHCP server, leases, reservations
-- `wifi.tsx` - WiFi AP configuration
+- `dhcp.tsx` - DHCP server, leases, reservations with device names
+- `wifi.tsx` - WiFi AP configuration and connected clients
+- `stats.tsx` - Network statistics and traffic monitoring
 - `wireguard.tsx` - VPN peers with QR code generation
 - `wireguard-p2p.tsx` - Site-to-site tunnel management
 - `firewall.tsx` - Port forwards and rules
-- `multiwan.tsx` - Multi-WAN failover status
 - `external-dns.tsx` - External DNS zones and SSL
 - `settings.tsx` - System settings and service management
 - `setup.tsx` - Initial setup wizard
@@ -171,6 +172,7 @@ All endpoints under `/api/` with session-cookie authentication:
 **Key Components:**
 - `PendingConfirmBanner.tsx` - Shows rollback countdown
 - `ServiceStatusCard.tsx` - Service health display
+- `LogModal.tsx` - Real-time log streaming via WebSocket
 
 ## Development Workflow
 
