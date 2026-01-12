@@ -44,16 +44,18 @@ type FailoverStatus struct {
 
 // Manager handles multi-WAN failover
 type Manager struct {
-	mu           sync.RWMutex
-	runner       system.CommandRunner
-	fs           system.FileSystem
-	config       *config.MultiWANConfig
-	status       map[string]*WANStatus // keyed by interface name
-	activeWAN    string
-	lastSwitch   time.Time
-	switchCount  int
-	stopChan     chan struct{}
-	running      bool
+	mu              sync.RWMutex
+	runner          system.CommandRunner
+	fs              system.FileSystem
+	wans            []config.WANConfig
+	failbackDelay   int
+	status          map[string]*WANStatus // keyed by interface name
+	activeWAN       string
+	lastSwitch      time.Time
+	switchCount     int
+	stopChan        chan struct{}
+	running         bool
+	hadHealthyWANs  bool // Track if we previously had healthy WANs (for logging)
 }
 
 // New creates a new multi-WAN manager
@@ -65,20 +67,24 @@ func New(runner system.CommandRunner, fs system.FileSystem) *Manager {
 	}
 }
 
-// Configure sets the multi-WAN configuration
-func (m *Manager) Configure(cfg *config.MultiWANConfig) {
+// Configure sets the multi-WAN configuration from the main config
+func (m *Manager) Configure(cfg *config.Config) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.config = cfg
+	m.wans = cfg.WANs
+	m.failbackDelay = cfg.FailbackDelay
+	if m.failbackDelay <= 0 {
+		m.failbackDelay = 60 // default 60 seconds
+	}
 	m.status = make(map[string]*WANStatus)
 
-	if cfg == nil || !cfg.Enabled {
+	if len(m.wans) == 0 {
 		return
 	}
 
 	// Initialize status for each WAN
-	for _, wan := range cfg.WANs {
+	for _, wan := range m.wans {
 		if !wan.Enabled {
 			continue
 		}
@@ -99,15 +105,24 @@ func (m *Manager) Start(ctx context.Context) error {
 		m.mu.Unlock()
 		return nil
 	}
-	if m.config == nil || !m.config.Enabled {
+	if len(m.wans) == 0 {
 		m.mu.Unlock()
 		return nil
 	}
 	m.running = true
 	m.stopChan = make(chan struct{})
+	wans := m.wans
 	m.mu.Unlock()
 
-	logger.Info("Multi-WAN failover starting with %d WANs", len(m.config.WANs))
+	logger.Info("Multi-WAN failover starting with %d WANs", len(wans))
+
+	// Ensure all WANs have DHCP running (for health monitoring)
+	for i := range wans {
+		wan := &wans[i]
+		if wan.Enabled && (wan.Mode == "dhcp" || wan.Mode == "wifi") {
+			m.ensureDHCP(ctx, wan)
+		}
+	}
 
 	// Initial check and activation
 	m.checkAllWANs(ctx)
@@ -138,13 +153,22 @@ func (m *Manager) GetStatus() *FailoverStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if m.config == nil {
+	if len(m.wans) == 0 {
 		return &FailoverStatus{Enabled: false}
 	}
 
+	// Determine mode based on fuse_with_next flags
+	mode := "failover"
+	for _, wan := range m.wans {
+		if wan.FuseWithNext {
+			mode = "loadbalance (WIP)"
+			break
+		}
+	}
+
 	status := &FailoverStatus{
-		Enabled:     m.config.Enabled,
-		Mode:        m.config.Mode,
+		Enabled:     len(m.wans) > 0,
+		Mode:        mode,
 		ActiveWAN:   m.activeWAN,
 		LastSwitch:  m.lastSwitch,
 		SwitchCount: m.switchCount,
@@ -168,7 +192,7 @@ func (m *Manager) monitorLoop(ctx context.Context) {
 	// Get check interval from first enabled WAN, default 10s
 	interval := 10 * time.Second
 	m.mu.RLock()
-	for _, wan := range m.config.WANs {
+	for _, wan := range m.wans {
 		if wan.Enabled && wan.HealthCheckInterval > 0 {
 			interval = time.Duration(wan.HealthCheckInterval) * time.Second
 			break
@@ -195,18 +219,15 @@ func (m *Manager) monitorLoop(ctx context.Context) {
 // checkAllWANs runs health checks on all configured WANs
 func (m *Manager) checkAllWANs(ctx context.Context) {
 	m.mu.RLock()
-	cfg := m.config
+	wans := m.wans
 	m.mu.RUnlock()
 
-	if cfg == nil {
-		return
-	}
-
-	for _, wan := range cfg.WANs {
+	for i := range wans {
+		wan := &wans[i]
 		if !wan.Enabled {
 			continue
 		}
-		m.checkWAN(ctx, &wan)
+		m.checkWAN(ctx, wan)
 	}
 }
 
@@ -229,7 +250,7 @@ func (m *Manager) checkWAN(ctx context.Context, wan *config.WANConfig) {
 	linkUp := m.checkLinkState(ctx, wan.Interface)
 
 	// Get IP and gateway
-	ip, gateway := m.getInterfaceInfo(ctx, wan.Interface)
+	ip, gateway := m.getInterfaceInfo(ctx, wan)
 
 	// Run health check (ping)
 	healthy := false
@@ -239,6 +260,9 @@ func (m *Manager) checkWAN(ctx context.Context, wan *config.WANConfig) {
 
 	// Update status
 	m.mu.Lock()
+	wasUp := status.Up
+	wasHealthy := status.Healthy
+
 	status.Up = linkUp
 	status.IPAddress = ip
 	status.Gateway = gateway
@@ -261,6 +285,19 @@ func (m *Manager) checkWAN(ctx context.Context, wan *config.WANConfig) {
 			status.Healthy = false
 		}
 	}
+
+	// Log state changes only
+	if wasUp && !linkUp {
+		logger.Warn("Multi-WAN: %s link DOWN", wan.Interface)
+	} else if !wasUp && linkUp {
+		logger.Info("Multi-WAN: %s link UP (ip=%s, gw=%s)", wan.Interface, ip, gateway)
+	}
+
+	if wasHealthy && !status.Healthy {
+		logger.Warn("Multi-WAN: %s UNHEALTHY (failures=%d)", wan.Interface, status.FailureCount)
+	} else if !wasHealthy && status.Healthy {
+		logger.Info("Multi-WAN: %s HEALTHY", wan.Interface)
+	}
 	m.mu.Unlock()
 }
 
@@ -270,11 +307,14 @@ func (m *Manager) checkLinkState(ctx context.Context, iface string) bool {
 	if err != nil {
 		return false
 	}
+	// Check for "state UP" - unplugged cables show "state DOWN" or "NO-CARRIER"
 	return strings.Contains(string(out), "state UP")
 }
 
 // getInterfaceInfo gets IP and gateway for an interface
-func (m *Manager) getInterfaceInfo(ctx context.Context, iface string) (ip, gateway string) {
+func (m *Manager) getInterfaceInfo(ctx context.Context, wan *config.WANConfig) (ip, gateway string) {
+	iface := wan.Interface
+
 	// Get IP
 	out, err := m.runner.Run(ctx, "ip", "-4", "addr", "show", iface)
 	if err == nil {
@@ -284,7 +324,13 @@ func (m *Manager) getInterfaceInfo(ctx context.Context, iface string) (ip, gatew
 		}
 	}
 
-	// Get gateway - check routing table for this interface
+	// 1. For static mode, use configured gateway
+	if wan.Mode == "static" && wan.StaticGateway != "" {
+		gateway = wan.StaticGateway
+		return ip, gateway
+	}
+
+	// 2. Check routing table for this interface (works for active WAN)
 	out, err = m.runner.Run(ctx, "ip", "route", "show", "dev", iface)
 	if err == nil {
 		// Look for default route or extract gateway from route
@@ -298,47 +344,111 @@ func (m *Manager) getInterfaceInfo(ctx context.Context, iface string) (ip, gatew
 				}
 			}
 		}
-		// If no default route, try to find any gateway
+		// If no default route, try to find any "via" gateway
 		if gateway == "" {
 			re := regexp.MustCompile(`via (\d+\.\d+\.\d+\.\d+)`)
 			if matches := re.FindStringSubmatch(string(out)); len(matches) >= 2 {
 				gateway = matches[1]
 			}
 		}
-		// For DHCP, gateway might be in .1 of the subnet
-		if gateway == "" && ip != "" {
-			parts := strings.Split(ip, ".")
-			if len(parts) == 4 {
-				gateway = fmt.Sprintf("%s.%s.%s.1", parts[0], parts[1], parts[2])
-			}
+	}
+
+	// 3. Check dhclient lease file for gateway (for DHCP/WiFi modes without default route)
+	if gateway == "" {
+		gateway = m.getGatewayFromDHCPLease(ctx, iface)
+	}
+
+	// 4. Fallback: derive from IP (x.x.x.1)
+	if gateway == "" && ip != "" {
+		parts := strings.Split(ip, ".")
+		if len(parts) == 4 {
+			gateway = fmt.Sprintf("%s.%s.%s.1", parts[0], parts[1], parts[2])
 		}
 	}
 
 	return ip, gateway
 }
 
-// runHealthCheck pings targets to verify connectivity
-func (m *Manager) runHealthCheck(ctx context.Context, wan *config.WANConfig, gateway string) bool {
-	targets := wan.HealthCheckTargets
-	if len(targets) == 0 {
-		// Default targets: gateway and 8.8.8.8
-		targets = []string{gateway, "8.8.8.8"}
+// getGatewayFromDHCPLease parses dhclient lease file for gateway
+func (m *Manager) getGatewayFromDHCPLease(ctx context.Context, iface string) string {
+	// dhclient stores leases in /var/lib/dhcp/dhclient.<interface>.leases
+	leasePaths := []string{
+		fmt.Sprintf("/var/lib/dhcp/dhclient.%s.leases", iface),
+		fmt.Sprintf("/var/lib/dhcp/dhclient-%s.leases", iface),
+		"/var/lib/dhcp/dhclient.leases",
 	}
 
+	for _, leasePath := range leasePaths {
+		data, err := m.fs.ReadFile(leasePath)
+		if err != nil {
+			continue
+		}
+
+		// Parse lease file looking for most recent "option routers" line
+		// Format: option routers 192.168.1.1;
+		lines := strings.Split(string(data), "\n")
+		var lastGateway string
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "option routers ") {
+				// Extract gateway IP
+				line = strings.TrimPrefix(line, "option routers ")
+				line = strings.TrimSuffix(line, ";")
+				// May have multiple routers, take first one
+				parts := strings.Split(line, ",")
+				if len(parts) > 0 {
+					gw := strings.TrimSpace(parts[0])
+					if gw != "" {
+						lastGateway = gw
+					}
+				}
+			}
+		}
+
+		if lastGateway != "" {
+			return lastGateway
+		}
+	}
+
+	return ""
+}
+
+// runHealthCheck pings targets to verify connectivity
+func (m *Manager) runHealthCheck(ctx context.Context, wan *config.WANConfig, gateway string) bool {
 	timeout := wan.HealthCheckTimeout
 	if timeout <= 0 {
 		timeout = 5
 	}
 
-	// Must be able to reach at least one target
-	for _, target := range targets {
-		if target == "" {
-			continue
-		}
-		// Ping through specific interface
-		out, err := m.runner.Run(ctx, "ping", "-I", wan.Interface, "-c", "1", "-W", fmt.Sprintf("%d", timeout), target)
+	// For non-active WANs, we can only reliably ping the gateway
+	// (external targets like 8.8.8.8 require a default route)
+	m.mu.RLock()
+	isActiveWAN := m.activeWAN == wan.Interface
+	m.mu.RUnlock()
+
+	// Always try gateway first - this works for any WAN with a local route
+	if gateway != "" {
+		out, err := m.runner.Run(ctx, "ping", "-I", wan.Interface, "-c", "1", "-W", fmt.Sprintf("%d", timeout), gateway)
 		if err == nil && strings.Contains(string(out), "1 received") {
 			return true
+		}
+	}
+
+	// For active WAN, also try external targets (they have the default route)
+	if isActiveWAN {
+		targets := wan.HealthCheckTargets
+		if len(targets) == 0 {
+			targets = []string{"8.8.8.8", "1.1.1.1"}
+		}
+
+		for _, target := range targets {
+			if target == "" || target == gateway {
+				continue
+			}
+			out, err := m.runner.Run(ctx, "ping", "-I", wan.Interface, "-c", "1", "-W", fmt.Sprintf("%d", timeout), target)
+			if err == nil && strings.Contains(string(out), "1 received") {
+				return true
+			}
 		}
 	}
 
@@ -350,7 +460,7 @@ func (m *Manager) selectActiveWAN(ctx context.Context) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.config == nil || !m.config.Enabled {
+	if len(m.wans) == 0 {
 		return
 	}
 
@@ -367,8 +477,15 @@ func (m *Manager) selectActiveWAN(ctx context.Context) {
 	})
 
 	if len(healthyWANs) == 0 {
-		logger.Warn("Multi-WAN: No healthy WANs available!")
+		if m.hadHealthyWANs {
+			logger.Warn("Multi-WAN: No healthy WANs available!")
+			m.hadHealthyWANs = false
+		}
 		return
+	}
+
+	if !m.hadHealthyWANs {
+		m.hadHealthyWANs = true
 	}
 
 	bestWAN := healthyWANs[0]
@@ -380,13 +497,8 @@ func (m *Manager) selectActiveWAN(ctx context.Context) {
 
 	// Check failback delay - don't switch back to primary too quickly
 	if m.activeWAN != "" && bestWAN.Priority < m.status[m.activeWAN].Priority {
-		failbackDelay := m.config.FailbackDelay
-		if failbackDelay <= 0 {
-			failbackDelay = 60
-		}
-		if time.Since(m.lastSwitch) < time.Duration(failbackDelay)*time.Second {
-			logger.Info("Multi-WAN: Waiting for failback delay before switching to %s", bestWAN.Interface)
-			return
+		if time.Since(m.lastSwitch) < time.Duration(m.failbackDelay)*time.Second {
+			return // Waiting for failback delay
 		}
 	}
 
@@ -402,10 +514,29 @@ func (m *Manager) selectActiveWAN(ctx context.Context) {
 	m.lastSwitch = time.Now()
 	m.switchCount++
 
-	logger.Info("Multi-WAN: Switching from %s to %s (priority %d)", oldWAN, bestWAN.Interface, bestWAN.Priority)
+	if oldWAN == "" {
+		logger.Info("Multi-WAN: Setting initial WAN to %s (priority %d)", bestWAN.Interface, bestWAN.Priority)
+	} else {
+		logger.Info("Multi-WAN: Switching from %s to %s (priority %d)", oldWAN, bestWAN.Interface, bestWAN.Priority)
+	}
+
+	// Get WAN config for the new active WAN
+	var activeWANConfig *config.WANConfig
+	for i := range m.wans {
+		if m.wans[i].Interface == bestWAN.Interface {
+			activeWANConfig = &m.wans[i]
+			break
+		}
+	}
 
 	// Apply the route change (unlock during route change to avoid deadlock)
 	m.mu.Unlock()
+
+	// Ensure DHCP is fresh on the new active WAN
+	if activeWANConfig != nil && (activeWANConfig.Mode == "dhcp" || activeWANConfig.Mode == "wifi") {
+		m.ensureDHCP(ctx, activeWANConfig)
+	}
+
 	m.applyRouteChange(ctx, bestWAN.Interface, bestWAN.Gateway)
 	m.mu.Lock()
 }
@@ -474,7 +605,11 @@ func (m *Manager) ForceSwitch(ctx context.Context, iface string) error {
 	gateway := status.Gateway
 	m.mu.Unlock()
 
-	logger.Info("Multi-WAN: Manual switch from %s to %s", oldWAN, iface)
+	if oldWAN == "" {
+		logger.Info("Multi-WAN: Manual switch to %s", iface)
+	} else {
+		logger.Info("Multi-WAN: Manual switch from %s to %s", oldWAN, iface)
+	}
 
 	m.applyRouteChange(ctx, iface, gateway)
 	return nil
@@ -487,9 +622,46 @@ func (m *Manager) GetActiveWAN() string {
 	return m.activeWAN
 }
 
-// IsEnabled returns whether multi-WAN is enabled
+// IsEnabled returns whether multi-WAN is enabled (any WANs configured)
 func (m *Manager) IsEnabled() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.config != nil && m.config.Enabled
+	return len(m.wans) > 0
+}
+
+// ensureDHCP ensures an interface has a DHCP lease for health monitoring
+func (m *Manager) ensureDHCP(ctx context.Context, wan *config.WANConfig) {
+	iface := wan.Interface
+
+	// Check if interface already has an IP
+	out, err := m.runner.Run(ctx, "ip", "-4", "addr", "show", iface)
+	if err == nil && strings.Contains(string(out), "inet ") {
+		logger.Debug("Multi-WAN: %s already has IP, skipping DHCP", iface)
+		return
+	}
+
+	logger.Info("Multi-WAN: Requesting DHCP for %s", iface)
+
+	// Try dhcpcd first (more common on modern systems), then dhclient
+	if _, err := m.runner.Run(ctx, "which", "dhcpcd"); err == nil {
+		out, err := m.runner.Run(ctx, "dhcpcd", "-4", "-b", iface)
+		if err != nil {
+			logger.Warn("Multi-WAN: dhcpcd failed for %s: %s", iface, string(out))
+		} else {
+			logger.Info("Multi-WAN: DHCP started for %s via dhcpcd", iface)
+			return
+		}
+	}
+
+	if _, err := m.runner.Run(ctx, "which", "dhclient"); err == nil {
+		out, err := m.runner.Run(ctx, "dhclient", "-4", iface)
+		if err != nil {
+			logger.Warn("Multi-WAN: dhclient failed for %s: %s", iface, string(out))
+		} else {
+			logger.Info("Multi-WAN: DHCP started for %s via dhclient", iface)
+			return
+		}
+	}
+
+	logger.Error("Multi-WAN: No DHCP client available for %s", iface)
 }

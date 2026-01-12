@@ -55,6 +55,7 @@ type Server struct {
 	multiwan     *multiwan.Manager
 	deps         *system.DependencyChecker
 	health       *health.Runner
+	bootstrap    *startup.Bootstrap
 	rollback     *rollback.Manager
 	stats        *stats.Manager
 	statsStore   stats.Store
@@ -204,54 +205,14 @@ func New(cfg *config.Config, configPath string, dryRun bool, version string) (*S
 	// Initialize services manager
 	s.svcManager = services.New(cfg, configPath, fs, runner, s.dns, s.haproxy)
 
-	// Initialize health check runner with router config
-	s.health = health.NewRunner(runner, fs)
+	// Initialize bootstrap (creates health runner with all checks registered)
+	// Bootstrap handles both startup configuration and ongoing health checks
+	s.bootstrap = startup.New(runner, fs, cfg, s.wireguardP2P)
+	s.health = s.bootstrap.GetHealthRunner()
 
-	// Build WireGuard interface list for health checks
-	var wgInterfaces []health.WireGuardInterfaceConfig
-	// Add main WireGuard interface (wg0) - always add if config exists so user can see status
-	if cfg.WireGuard != nil {
-		wgInterfaces = append(wgInterfaces, health.WireGuardInterfaceConfig{
-			Name:       cfg.WireGuard.Interface,
-			ConfigPath: cfg.WireGuard.ConfigPath,
-			Enabled:    cfg.WireGuard.Enabled,
-		})
-	}
-	// Add P2P/Site-to-Site tunnels
-	if cfg.WireGuardP2P != nil {
-		for _, tunnel := range cfg.WireGuardP2P.Tunnels {
-			if tunnel.Enabled {
-				wgInterfaces = append(wgInterfaces, health.WireGuardInterfaceConfig{
-					Name:       tunnel.Interface,
-					ConfigPath: fmt.Sprintf("/etc/wireguard/%s.conf", tunnel.Interface),
-					Enabled:    true,
-				})
-			}
-		}
-	}
-
-	// Collect WiFi AP interfaces (these are LAN, not WAN)
-	var wifiAPInterfaces []string
-	for _, wifi := range cfg.WiFiInterfaces {
-		if wifi.Enabled && wifi.Interface != "" {
-			wifiAPInterfaces = append(wifiAPInterfaces, wifi.Interface)
-		}
-	}
-
-	health.RegisterAllChecksWithConfig(s.health, runner, fs, &health.RouterConfig{
-		LANBridge:           cfg.LANBridge,
-		LANAddresses:        cfg.LANAddresses,
-		WANInterface:        cfg.WANInterface,
-		WANMode:             cfg.WANMode,
-		DHCPStart:           cfg.DHCPStart,
-		DHCPEnd:             cfg.DHCPEnd,
-		WireGuardInterfaces: wgInterfaces,
-		WiFiAPInterfaces:    wifiAPInterfaces,
-	})
-
-	// Configure multi-WAN if enabled
-	if cfg.MultiWAN != nil {
-		s.multiwan.Configure(cfg.MultiWAN)
+	// Configure multi-WAN manager with WAN list from config
+	if len(cfg.WANs) > 0 {
+		s.multiwan.Configure(cfg)
 	}
 
 	// Parse templates
@@ -272,17 +233,16 @@ func (s *Server) Run() error {
 
 	ctx := context.Background()
 
-	// Run startup bootstrap to apply essential config (IP forwarding, NAT, WireGuard, etc.)
-	// This ensures the router works after reboot without manual health check fixes
+	// Run startup bootstrap to apply essential config via health checks with auto-fix
+	// This ensures the router works after reboot without manual intervention
 	if !s.dryRun {
-		bootstrap := startup.New(s.runner, s.fs, s.config, s.wireguardP2P)
-		if err := bootstrap.Run(ctx); err != nil {
+		if err := s.bootstrap.Run(ctx); err != nil {
 			log.Printf("Warning: startup bootstrap failed: %v", err)
 		}
 	}
 
-	// Start multi-WAN failover monitoring if enabled
-	if s.config.MultiWAN != nil && s.config.MultiWAN.Enabled {
+	// Start multi-WAN failover monitoring if there are configured WANs
+	if len(s.config.WANs) > 0 {
 		if err := s.multiwan.Start(ctx); err != nil {
 			log.Printf("Warning: Failed to start multi-WAN: %v", err)
 		}
@@ -394,6 +354,11 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("/api/multiwan/status", s.requireAPIAuth(s.handleAPIMultiWANStatus))
 	mux.HandleFunc("/api/multiwan/configure", s.requireAPIAuth(s.handleAPIMultiWANConfigure))
 	mux.HandleFunc("/api/multiwan/switch", s.requireAPIAuth(s.handleAPIMultiWANSwitch))
+	// WAN list endpoints (new unified WAN management)
+	mux.HandleFunc("/api/wans", s.requireAPIAuth(s.handleAPIWANs))
+	mux.HandleFunc("/api/wans/", s.requireAPIAuth(s.handleAPIWANByID))
+	mux.HandleFunc("/api/wans/reorder", s.requireAPIAuth(s.handleAPIWANsReorder))
+	mux.HandleFunc("/api/wans/autodetect", s.requireAPIAuth(s.handleAPIWANsAutoDetect))
 	mux.HandleFunc("/api/system/dependencies", s.requireAPIAuth(s.handleAPISystemDependencies))
 	mux.HandleFunc("/api/system/logs", s.requireAPIAuth(s.handleAPISystemLogs))
 	mux.HandleFunc("/api/system/shutdown", s.requireAPIAuth(s.handleAPISystemShutdown))

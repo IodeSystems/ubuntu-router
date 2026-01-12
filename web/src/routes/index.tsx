@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Box,
   Card,
@@ -22,6 +22,7 @@ import {
   DialogTitle,
   DialogContent,
   IconButton,
+  Collapse,
 } from '@mui/material';
 import {
   CheckCircle as CheckIcon,
@@ -34,9 +35,13 @@ import {
   AltRoute as RouteIcon,
   Link as LinkIcon,
   Close as CloseIcon,
+  ExpandMore as ExpandMoreIcon,
+  ExpandLess as ExpandLessIcon,
+  Devices as DevicesIcon,
 } from '@mui/icons-material';
 import { useQuery, useMutation } from '../api/hooks';
-import type { RouteLookupResult } from '../api/client';
+import { client } from '../api/client';
+import type { RouteLookupResult, WiFiStation } from '../api/client';
 import { ServiceStatusCard } from '../components/ServiceStatusCard';
 
 interface ServiceStatusProps {
@@ -91,13 +96,60 @@ function Dashboard() {
   const { data: routes } = useQuery('getRoutes');
   const { data: p2pStatus } = useQuery('getP2PStatus');
   const { data: wifiStatus } = useQuery('getWiFiStatus');
+  const { data: devicesData } = useQuery('listDevices');
   const { mutate: lookupRoute } = useMutation('lookupRoute');
+
+  // Get display name for a MAC address from devices database
+  const getDeviceName = (mac: string): string | null => {
+    const device = devicesData?.devices?.find(
+      d => d.mac.toLowerCase() === mac.toLowerCase()
+    );
+    if (!device) return null;
+    return device.display_name || device.hostname || null;
+  };
 
   // Route lookup modal state
   const [lookupOpen, setLookupOpen] = useState(false);
   const [lookupIP, setLookupIP] = useState('');
   const [lookupResult, setLookupResult] = useState<RouteLookupResult | null>(null);
   const [lookupError, setLookupError] = useState<string | null>(null);
+
+  // WiFi clients state
+  const [wifiStations, setWifiStations] = useState<Record<string, WiFiStation[]>>({});
+  const [wifiClientsExpanded, setWifiClientsExpanded] = useState(false);
+
+  // Fetch WiFi stations for all running interfaces
+  useEffect(() => {
+    const fetchStations = async () => {
+      if (!wifiStatus?.interfaces) return;
+      const newStations: Record<string, WiFiStation[]> = {};
+      for (const iface of wifiStatus.interfaces) {
+        if (iface.running) {
+          try {
+            const result = await client.listStations({ interface: iface.interface });
+            newStations[iface.interface] = result.stations || [];
+          } catch {
+            newStations[iface.interface] = [];
+          }
+        }
+      }
+      setWifiStations(newStations);
+    };
+    fetchStations();
+  }, [wifiStatus]);
+
+  // Flatten all stations for display
+  const allStations = Object.entries(wifiStations).flatMap(([iface, stations]) =>
+    stations.map(s => ({ ...s, interface: iface }))
+  );
+
+  const formatBytes = (bytes: number): string => {
+    if (!bytes || isNaN(bytes) || bytes < 0) return '0 B';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  };
 
   const handleRouteLookup = async () => {
     if (!lookupIP) return;
@@ -231,6 +283,66 @@ function Dashboard() {
         <Grid size={{ xs: 12, md: 6 }}>
           <ServiceStatusCard />
         </Grid>
+
+        {/* WiFi Clients */}
+        {wifiClients > 0 && (
+          <Grid size={{ xs: 12, md: 6 }}>
+            <Card>
+              <CardContent>
+                <Box
+                  sx={{ display: 'flex', alignItems: 'center', gap: 1, cursor: 'pointer' }}
+                  onClick={() => setWifiClientsExpanded(!wifiClientsExpanded)}
+                >
+                  <DevicesIcon color="primary" />
+                  <Typography variant="h6" color="primary" sx={{ flex: 1 }}>
+                    WiFi Clients ({wifiClients})
+                  </Typography>
+                  <IconButton size="small">
+                    {wifiClientsExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                  </IconButton>
+                </Box>
+                <Collapse in={wifiClientsExpanded}>
+                  <TableContainer sx={{ mt: 2, overflowX: 'auto' }}>
+                    <Table size="small" sx={{ minWidth: 400 }}>
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>MAC Address</TableCell>
+                          <TableCell>Interface</TableCell>
+                          <TableCell align="right">Signal</TableCell>
+                          <TableCell align="right">RX / TX</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {allStations.map((station) => {
+                          const deviceName = getDeviceName(station.mac);
+                          return (
+                            <TableRow key={station.mac}>
+                              <TableCell>
+                                {deviceName ? (
+                                  <>
+                                    <Typography variant="body2">{deviceName}</Typography>
+                                    <Typography variant="caption" color="text.secondary">
+                                      <code>{station.mac.toUpperCase()}</code>
+                                    </Typography>
+                                  </>
+                                ) : (
+                                  <code>{station.mac.toUpperCase()}</code>
+                                )}
+                              </TableCell>
+                              <TableCell><Chip label={station.interface} size="small" /></TableCell>
+                              <TableCell align="right">{station.signal} dBm</TableCell>
+                              <TableCell align="right">{formatBytes(station.rxBytes)} / {formatBytes(station.txBytes)}</TableCell>
+                            </TableRow>
+                          );
+                        })}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                </Collapse>
+              </CardContent>
+            </Card>
+          </Grid>
+        )}
 
         {/* Routing Table */}
         <Grid size={12}>

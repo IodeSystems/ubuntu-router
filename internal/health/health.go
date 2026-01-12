@@ -97,14 +97,25 @@ func NewBaseCheck(id, name, description string, deps []string, runner system.Com
 	}
 }
 
+// RunState represents the current state of the health check runner
+type RunState string
+
+const (
+	RunStateIdle    RunState = "idle"
+	RunStateRunning RunState = "running"
+)
+
 // Runner manages and executes health checks
 type Runner struct {
-	mu       sync.RWMutex
-	checks   map[string]Check
-	order    []string // Topologically sorted check order
-	results  map[string]*Status
-	runner   system.CommandRunner
-	fs       system.FileSystem
+	mu        sync.RWMutex
+	checks    map[string]Check
+	order     []string // Topologically sorted check order
+	results   map[string]*Status
+	runner    system.CommandRunner
+	fs        system.FileSystem
+	state     RunState
+	cancel    context.CancelFunc
+	fixResults []AutoFixResult
 }
 
 // NewRunner creates a new health check runner
@@ -114,7 +125,29 @@ func NewRunner(cmdRunner system.CommandRunner, fs system.FileSystem) *Runner {
 		results: make(map[string]*Status),
 		runner:  cmdRunner,
 		fs:      fs,
+		state:   RunStateIdle,
 	}
+}
+
+// IsRunning returns true if health checks are currently running
+func (r *Runner) IsRunning() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state == RunStateRunning
+}
+
+// GetState returns the current run state
+func (r *Runner) GetState() RunState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state
+}
+
+// GetFixResults returns the fix results from the last run
+func (r *Runner) GetFixResults() []AutoFixResult {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.fixResults
 }
 
 // Register adds a check to the runner
@@ -309,12 +342,14 @@ func (r *Runner) RunFixer(ctx context.Context, fixerID string) error {
 
 // Summary returns a summary of all check results
 type Summary struct {
-	Total    int           `json:"total"`
-	OK       int           `json:"ok"`
-	Warnings int           `json:"warnings"`
-	Errors   int           `json:"errors"`
-	Skipped  int           `json:"skipped"`
-	Results  []*Status     `json:"results"`
+	State      RunState        `json:"state"`
+	Total      int             `json:"total"`
+	OK         int             `json:"ok"`
+	Warnings   int             `json:"warnings"`
+	Errors     int             `json:"errors"`
+	Skipped    int             `json:"skipped"`
+	Results    []*Status       `json:"results"`
+	FixResults []AutoFixResult `json:"fix_results,omitempty"`
 }
 
 // GetSummary returns a summary of the last run
@@ -322,7 +357,10 @@ func (r *Runner) GetSummary() *Summary {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	summary := &Summary{}
+	summary := &Summary{
+		State:      r.state,
+		FixResults: r.fixResults,
+	}
 
 	for _, status := range r.results {
 		summary.Total++
@@ -340,4 +378,187 @@ func (r *Runner) GetSummary() *Summary {
 	}
 
 	return summary
+}
+
+// AutoFixResult contains results from an auto-fix run
+type AutoFixResult struct {
+	CheckID     string `json:"check_id"`
+	FixerID     string `json:"fixer_id"`
+	Description string `json:"description"`
+	Success     bool   `json:"success"`
+	Error       string `json:"error,omitempty"`
+}
+
+// RunAllWithAutoFix executes all checks and automatically applies fixers for issues
+// Returns the check results and any fix results
+func (r *Runner) RunAllWithAutoFix(ctx context.Context) ([]*Status, []AutoFixResult, error) {
+	// First run all checks
+	results, err := r.RunAll(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Collect and apply fixers for any issues
+	var fixResults []AutoFixResult
+	fixers := r.GetFixers()
+
+	for fixerID, fixer := range fixers {
+		result := AutoFixResult{
+			FixerID:     fixerID,
+			Description: fixer.Description,
+		}
+
+		// Apply the fix
+		if err := fixer.Fix(ctx); err != nil {
+			result.Success = false
+			result.Error = err.Error()
+		} else {
+			result.Success = true
+		}
+
+		fixResults = append(fixResults, result)
+	}
+
+	// If any fixes were applied, re-run checks to get updated status
+	if len(fixResults) > 0 {
+		results, err = r.RunAll(ctx)
+		if err != nil {
+			return results, fixResults, err
+		}
+	}
+
+	return results, fixResults, nil
+}
+
+// StartAsync runs all checks asynchronously with optional auto-fix
+// Returns an error if checks are already running
+// Use GetSummary(), GetState(), or callback to monitor progress
+func (r *Runner) StartAsync(ctx context.Context, autoFix bool, callback func(status *Status, fixResult *AutoFixResult)) error {
+	r.mu.Lock()
+	if r.state == RunStateRunning {
+		r.mu.Unlock()
+		return fmt.Errorf("health checks already running")
+	}
+
+	// Cancel any previous context
+	if r.cancel != nil {
+		r.cancel()
+	}
+
+	// Create cancellable context
+	ctx, cancel := context.WithCancel(ctx)
+	r.cancel = cancel
+	r.state = RunStateRunning
+	r.fixResults = nil
+
+	// Compute order if needed
+	if r.order == nil {
+		order, err := r.computeOrder()
+		if err != nil {
+			r.state = RunStateIdle
+			r.mu.Unlock()
+			return err
+		}
+		r.order = order
+	}
+
+	// Clear previous results
+	r.results = make(map[string]*Status)
+	order := r.order
+	r.mu.Unlock()
+
+	go func() {
+		defer func() {
+			r.mu.Lock()
+			r.state = RunStateIdle
+			r.mu.Unlock()
+		}()
+
+		for _, id := range order {
+			// Check for cancellation
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			r.mu.RLock()
+			check := r.checks[id]
+			r.mu.RUnlock()
+
+			// Check if dependencies passed
+			skip := false
+			r.mu.RLock()
+			for _, dep := range check.DependsOn() {
+				if depResult, ok := r.results[dep]; ok {
+					if depResult.State == StateError || depResult.State == StateSkipped {
+						skip = true
+						break
+					}
+				}
+			}
+			r.mu.RUnlock()
+
+			var status *Status
+			if skip {
+				status = &Status{
+					CheckID:     check.ID(),
+					Name:        check.Name(),
+					Description: check.Description(),
+					State:       StateSkipped,
+					Message:     "Skipped due to failed dependency",
+				}
+			} else {
+				status = check.Run(ctx)
+			}
+
+			r.mu.Lock()
+			r.results[id] = status
+			r.mu.Unlock()
+
+			// Notify callback
+			if callback != nil {
+				callback(status, nil)
+			}
+
+			// Auto-fix if enabled and there are issues with fixers
+			if autoFix && (status.State == StateError || status.State == StateWarning) {
+				for _, issue := range status.Issues {
+					if issue.Fixer != nil && issue.FixerID != "" {
+						fixResult := &AutoFixResult{
+							CheckID:     id,
+							FixerID:     issue.FixerID,
+							Description: issue.Fixer.Description,
+						}
+						if err := issue.Fixer.Fix(ctx); err != nil {
+							fixResult.Success = false
+							fixResult.Error = err.Error()
+						} else {
+							fixResult.Success = true
+						}
+
+						r.mu.Lock()
+						r.fixResults = append(r.fixResults, *fixResult)
+						r.mu.Unlock()
+
+						if callback != nil {
+							callback(nil, fixResult)
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
+// Stop cancels any running health checks
+func (r *Runner) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
 }

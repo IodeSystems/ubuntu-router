@@ -20,7 +20,6 @@ import {
 import {
   Dashboard as DashboardIcon,
   Public as WANIcon,
-  SwapHoriz as MultiWANIcon,
   Router as RouterIcon,
   Dns as DnsIcon,
   DeviceHub as DhcpIcon,
@@ -54,7 +53,6 @@ const navItems = [
   { path: '/qos', label: 'QoS', icon: <QoSIcon /> },
   { path: '/setup', label: 'Setup', icon: <SetupIcon /> },
   { path: '/wan', label: 'WAN', icon: <WANIcon /> },
-  { path: '/multiwan', label: 'Multi-WAN', icon: <MultiWANIcon /> },
   { path: '/interfaces', label: 'Interfaces', icon: <RouterIcon /> },
   { path: '/dns', label: 'DNS', icon: <DnsIcon /> },
   { path: '/external-dns', label: 'External DNS', icon: <WANIcon /> },

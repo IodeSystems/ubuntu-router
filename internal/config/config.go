@@ -15,19 +15,19 @@ type Config struct {
 	// Server settings
 	ListenAddr string `json:"listen_addr"`
 
-	// WAN interface (internet uplink)
-	WANInterface string `json:"wan_interface"`
-	WANMode      string `json:"wan_mode"` // dhcp, static, pppoe, wifi
+	// WAN interfaces (internet uplinks) - ordered by priority
+	WANs          []WANConfig `json:"wans"`
+	FailbackDelay int         `json:"failback_delay,omitempty"` // Seconds to wait before failing back (default: 60)
 
-	// Static WAN settings (when wan_mode is "static")
+	// Legacy WAN fields (deprecated - migrated to WANs on load)
+	WANInterface     string `json:"wan_interface,omitempty"`
+	WANMode          string `json:"wan_mode,omitempty"`
 	WANStaticIP      string `json:"wan_static_ip,omitempty"`
 	WANStaticGateway string `json:"wan_static_gateway,omitempty"`
 	WANStaticDNS     string `json:"wan_static_dns,omitempty"`
-
-	// WiFi WAN settings (when wan_mode is "wifi")
-	WANWiFiSSID     string `json:"wan_wifi_ssid,omitempty"`
-	WANWiFiPassword string `json:"wan_wifi_password,omitempty"`
-	WANWiFiSecurity string `json:"wan_wifi_security,omitempty"` // wpa2, wpa3, open
+	WANWiFiSSID      string `json:"wan_wifi_ssid,omitempty"`
+	WANWiFiPassword  string `json:"wan_wifi_password,omitempty"`
+	WANWiFiSecurity  string `json:"wan_wifi_security,omitempty"`
 
 	// LAN settings
 	LANBridge    string   `json:"lan_bridge"`    // br0
@@ -69,9 +69,6 @@ type Config struct {
 	FirewallEnabled bool           `json:"firewall_enabled"`
 	PortForwards    []PortForward  `json:"port_forwards"`
 	FirewallRules   []FirewallRule `json:"firewall_rules"`
-
-	// Multi-WAN failover
-	MultiWAN *MultiWANConfig `json:"multi_wan,omitempty"`
 
 	// External DNS (libdns providers) and Let's Encrypt
 	ExternalDNS *ExternalDNSConfig `json:"external_dns,omitempty"`
@@ -222,11 +219,15 @@ type FirewallRule struct {
 
 // WANConfig represents a WAN interface configuration
 type WANConfig struct {
-	Name     string `json:"name"`               // User-friendly name (e.g., "Primary", "Backup")
-	Interface string `json:"interface"`         // eth0, wlan0, etc.
-	Enabled  bool   `json:"enabled"`
-	Priority int    `json:"priority"`           // Lower = higher priority (0 = primary)
-	Mode     string `json:"mode"`               // dhcp, static, wifi
+	ID        string `json:"id"`                 // Unique ID for this WAN
+	Name      string `json:"name"`               // User-friendly name (e.g., "Primary", "Backup")
+	Interface string `json:"interface"`          // eth0, wlan0, etc.
+	Enabled   bool   `json:"enabled"`
+	Priority  int    `json:"priority"`           // Lower = higher priority (0 = primary)
+	Mode      string `json:"mode"`               // dhcp, static, pppoe, wifi
+
+	// Load balancing (WIP - not yet implemented)
+	FuseWithNext bool `json:"fuse_with_next"` // Combine with next priority WAN for load balancing
 
 	// Static mode settings
 	StaticIP      string `json:"static_ip,omitempty"`
@@ -244,14 +245,6 @@ type WANConfig struct {
 	HealthCheckInterval int      `json:"health_check_interval,omitempty"` // Seconds between checks (default: 10)
 	HealthCheckTimeout  int      `json:"health_check_timeout,omitempty"`  // Seconds to wait for response (default: 5)
 	HealthCheckRetries  int      `json:"health_check_retries,omitempty"`  // Failures before marking down (default: 3)
-}
-
-// MultiWANConfig represents multi-WAN failover settings
-type MultiWANConfig struct {
-	Enabled       bool        `json:"enabled"`
-	Mode          string      `json:"mode"`           // failover, loadbalance (future)
-	WANs          []WANConfig `json:"wans"`
-	FailbackDelay int         `json:"failback_delay"` // Seconds to wait before failing back to primary (default: 60)
 }
 
 // DNSProviderType identifies which external DNS provider to use
@@ -475,6 +468,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
+	// Migrate legacy WAN config to new WANs list
+	cfg.migrateWANConfig()
+
 	// Apply defaults to WiFi interfaces
 	for i := range cfg.WiFiInterfaces {
 		if cfg.WiFiInterfaces[i].SSID == "" {
@@ -483,6 +479,118 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// migrateWANConfig converts legacy single-WAN config to the new WANs list format
+func (cfg *Config) migrateWANConfig() {
+	// If WANs already populated, nothing to migrate
+	if len(cfg.WANs) > 0 {
+		// Ensure all WANs have IDs
+		for i := range cfg.WANs {
+			if cfg.WANs[i].ID == "" {
+				cfg.WANs[i].ID = GenerateWANID()
+			}
+		}
+		return
+	}
+
+	// Migrate legacy single WAN config
+	if cfg.WANInterface != "" {
+		wan := WANConfig{
+			ID:        GenerateWANID(),
+			Name:      "Primary",
+			Interface: cfg.WANInterface,
+			Enabled:   true,
+			Priority:  0,
+			Mode:      cfg.WANMode,
+			// Static settings
+			StaticIP:      cfg.WANStaticIP,
+			StaticGateway: cfg.WANStaticGateway,
+			StaticDNS:     cfg.WANStaticDNS,
+			// WiFi settings
+			WiFiSSID:     cfg.WANWiFiSSID,
+			WiFiPassword: cfg.WANWiFiPassword,
+			WiFiSecurity: cfg.WANWiFiSecurity,
+			// Default health check
+			HealthCheckEnabled:  true,
+			HealthCheckTargets:  []string{"8.8.8.8", "1.1.1.1"},
+			HealthCheckInterval: 10,
+			HealthCheckTimeout:  5,
+			HealthCheckRetries:  3,
+		}
+		if wan.Mode == "" {
+			wan.Mode = "dhcp"
+		}
+		cfg.WANs = []WANConfig{wan}
+
+		// Clear legacy fields
+		cfg.WANInterface = ""
+		cfg.WANMode = ""
+		cfg.WANStaticIP = ""
+		cfg.WANStaticGateway = ""
+		cfg.WANStaticDNS = ""
+		cfg.WANWiFiSSID = ""
+		cfg.WANWiFiPassword = ""
+		cfg.WANWiFiSecurity = ""
+	}
+}
+
+// GenerateWANID creates a unique ID for a WAN
+func GenerateWANID() string {
+	b := make([]byte, 4)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// GetPrimaryWAN returns the highest priority enabled WAN, or nil if none
+func (cfg *Config) GetPrimaryWAN() *WANConfig {
+	var best *WANConfig
+	for i := range cfg.WANs {
+		wan := &cfg.WANs[i]
+		if wan.Enabled {
+			if best == nil || wan.Priority < best.Priority {
+				best = wan
+			}
+		}
+	}
+	return best
+}
+
+// GetPrimaryWANInterface returns the interface name of the primary WAN for backward compatibility
+func (cfg *Config) GetPrimaryWANInterface() string {
+	wan := cfg.GetPrimaryWAN()
+	if wan != nil {
+		return wan.Interface
+	}
+	return ""
+}
+
+// GetPrimaryWANMode returns the mode of the primary WAN for backward compatibility
+func (cfg *Config) GetPrimaryWANMode() string {
+	wan := cfg.GetPrimaryWAN()
+	if wan != nil {
+		return wan.Mode
+	}
+	return ""
+}
+
+// GetEnabledWANs returns all enabled WANs sorted by priority
+func (cfg *Config) GetEnabledWANs() []WANConfig {
+	var enabled []WANConfig
+	for _, wan := range cfg.WANs {
+		if wan.Enabled {
+			enabled = append(enabled, wan)
+		}
+	}
+	// Sort by priority
+	for i := 0; i < len(enabled); i++ {
+		for j := i + 1; j < len(enabled); j++ {
+			if enabled[j].Priority < enabled[i].Priority {
+				enabled[i], enabled[j] = enabled[j], enabled[i]
+			}
+		}
+	}
+	return enabled
 }
 
 // Save writes config to a JSON file

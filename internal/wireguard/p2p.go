@@ -536,6 +536,18 @@ func (m *P2PManager) ValidateTunnelConfig(tunnel *config.WireGuardP2PTunnel, cfg
 	localSubnets := GetLocalSubnets(cfg)
 	routerAddresses := GetRouterAddresses(cfg)
 
+	// Calculate the current tunnel's own network to exclude from conflict detection
+	// The tunnel's network is BY DEFINITION reachable through the tunnel
+	var ownTunnelNetwork string
+	if tunnel.Address != "" {
+		ip, ipNet, err := net.ParseCIDR(tunnel.Address)
+		if err == nil {
+			networkAddr := ip.Mask(ipNet.Mask)
+			ones, _ := ipNet.Mask.Size()
+			ownTunnelNetwork = fmt.Sprintf("%s/%d", networkAddr.String(), ones)
+		}
+	}
+
 	// Check for common dangerous subnets (WAN access, default routes)
 	dangerousSubnets := map[string]string{
 		"0.0.0.0/0":      "default route - would route ALL traffic through tunnel",
@@ -553,6 +565,10 @@ func (m *P2PManager) ValidateTunnelConfig(tunnel *config.WireGuardP2PTunnel, cfg
 
 		// Check against local subnets
 		for _, localSub := range localSubnets {
+			// Skip the tunnel's own network - it's expected to overlap with remote subnets
+			if ownTunnelNetwork != "" && localSub == ownTunnelNetwork {
+				continue
+			}
 			if subnetsOverlap(remoteSub, localSub) {
 				hasConflict = true
 				result.Conflicts = append(result.Conflicts, SubnetConflict{
@@ -565,10 +581,21 @@ func (m *P2PManager) ValidateTunnelConfig(tunnel *config.WireGuardP2PTunnel, cfg
 		}
 
 		// Check if remote subnet contains router's own addresses
+		// Skip the tunnel's own IP - it's expected to be in the remote subnet
 		if !hasConflict {
+			var ownTunnelIP string
+			if tunnel.Address != "" {
+				if ip, _, err := net.ParseCIDR(tunnel.Address); err == nil {
+					ownTunnelIP = ip.String()
+				}
+			}
 			_, remoteNet, err := net.ParseCIDR(remoteSub)
 			if err == nil {
 				for _, addr := range routerAddresses {
+					// Skip the tunnel's own IP
+					if addr == ownTunnelIP {
+						continue
+					}
 					ip := net.ParseIP(addr)
 					if ip != nil && remoteNet.Contains(ip) {
 						hasConflict = true

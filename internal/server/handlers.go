@@ -738,6 +738,16 @@ func (s *Server) handleAPILeases(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Update device tracking for each lease with a valid hostname
+	if s.statsStore != nil {
+		ctx := r.Context()
+		for _, lease := range leases {
+			if lease.Hostname != "*" && lease.Hostname != "" {
+				_ = s.statsStore.UpdateDeviceSeen(ctx, lease.MAC, lease.IP, lease.Hostname)
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"leases": leases,

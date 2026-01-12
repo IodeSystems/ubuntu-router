@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Box,
   Card,
@@ -17,6 +17,13 @@ import {
   Checkbox,
   CircularProgress,
   Alert,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableRow,
+  TableContainer,
+  Collapse,
 } from '@mui/material';
 import {
   PlayArrow as StartIcon,
@@ -26,17 +33,31 @@ import {
   Edit as EditIcon,
   Visibility as VisibilityIcon,
   VisibilityOff as VisibilityOffIcon,
+  ExpandMore as ExpandMoreIcon,
+  ExpandLess as ExpandLessIcon,
+  Devices as DevicesIcon,
 } from '@mui/icons-material';
 import { IconButton, InputAdornment } from '@mui/material';
 import { useQuery, useMutation } from '../api/hooks';
 import { client } from '../api/client';
+import type { WiFiStation } from '../api/client';
 
 function WiFiPage() {
   const { data: statusData, isLoading: statusLoading, refetch } = useQuery('getWiFiStatus');
   const { data: interfacesData } = useQuery('listWiFiInterfaces');
+  const { data: devicesData } = useQuery('listDevices');
   const { mutate: configureAP, isLoading: isConfiguring } = useMutation('configureAP');
   const { mutate: control, isLoading: isControlling } = useMutation('wifiControl');
   const { mutate: deleteWifi, isLoading: isDeleting } = useMutation('wifiDelete');
+
+  // Get display name for a MAC address from devices database
+  const getDeviceName = (mac: string): string | null => {
+    const device = devicesData?.devices?.find(
+      d => d.mac.toLowerCase() === mac.toLowerCase()
+    );
+    if (!device) return null;
+    return device.display_name || device.hostname || null;
+  };
 
   const [config, setConfig] = useState({
     interface: '',
@@ -54,6 +75,48 @@ function WiFiPage() {
   const [success, setSuccess] = useState<string | null>(null);
   const [showPassword, setShowPassword] = useState(false);
   const [editingInterface, setEditingInterface] = useState<string | null>(null);
+  const [stations, setStations] = useState<Record<string, WiFiStation[]>>({});
+  const [expandedInterfaces, setExpandedInterfaces] = useState<Set<string>>(new Set());
+
+  // Fetch stations for each running interface
+  useEffect(() => {
+    const fetchStations = async () => {
+      if (!statusData?.interfaces) return;
+      const newStations: Record<string, WiFiStation[]> = {};
+      for (const iface of statusData.interfaces) {
+        if (iface.running) {
+          try {
+            const result = await client.listStations({ interface: iface.interface });
+            newStations[iface.interface] = result.stations || [];
+          } catch {
+            newStations[iface.interface] = [];
+          }
+        }
+      }
+      setStations(newStations);
+    };
+    fetchStations();
+  }, [statusData]);
+
+  const toggleExpanded = (iface: string) => {
+    setExpandedInterfaces(prev => {
+      const next = new Set(prev);
+      if (next.has(iface)) {
+        next.delete(iface);
+      } else {
+        next.add(iface);
+      }
+      return next;
+    });
+  };
+
+  const formatBytes = (bytes: number): string => {
+    if (!bytes || isNaN(bytes) || bytes < 0) return '0 B';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  };
 
   const handleConfigure = async () => {
     if (!config.interface) {
@@ -340,9 +403,70 @@ function WiFiPage() {
                   <Typography>{iface.channel} ({iface.frequency} MHz)</Typography>
                   <Typography color="text.secondary">TX Power:</Typography>
                   <Typography>{iface.txPower} dBm</Typography>
-                  <Typography color="text.secondary">Stations:</Typography>
-                  <Typography>{iface.stationCount}</Typography>
+                  <Typography color="text.secondary">Clients:</Typography>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Typography>{iface.stationCount}</Typography>
+                    {iface.stationCount > 0 && (
+                      <IconButton
+                        size="small"
+                        onClick={() => toggleExpanded(iface.interface)}
+                        sx={{ p: 0 }}
+                      >
+                        {expandedInterfaces.has(iface.interface) ? <ExpandLessIcon fontSize="small" /> : <ExpandMoreIcon fontSize="small" />}
+                      </IconButton>
+                    )}
+                  </Box>
                 </Box>
+                <Collapse in={expandedInterfaces.has(iface.interface)}>
+                  {stations[iface.interface]?.length > 0 && (
+                    <Box sx={{ mb: 2 }}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                        <DevicesIcon fontSize="small" color="primary" />
+                        <Typography variant="subtitle2" color="primary">Connected Clients</Typography>
+                      </Box>
+                      <TableContainer sx={{ overflowX: 'auto' }}>
+                        <Table size="small" sx={{ minWidth: 500 }}>
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>MAC Address</TableCell>
+                              <TableCell align="right">Signal</TableCell>
+                              <TableCell align="right">RX Rate</TableCell>
+                              <TableCell align="right">TX Rate</TableCell>
+                              <TableCell align="right">RX</TableCell>
+                              <TableCell align="right">TX</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {stations[iface.interface].map((station) => {
+                              const deviceName = getDeviceName(station.mac);
+                              return (
+                                <TableRow key={station.mac}>
+                                  <TableCell>
+                                    {deviceName ? (
+                                      <>
+                                        <Typography variant="body2">{deviceName}</Typography>
+                                        <Typography variant="caption" color="text.secondary">
+                                          <code>{station.mac.toUpperCase()}</code>
+                                        </Typography>
+                                      </>
+                                    ) : (
+                                      <code>{station.mac.toUpperCase()}</code>
+                                    )}
+                                  </TableCell>
+                                  <TableCell align="right">{station.signal} dBm</TableCell>
+                                  <TableCell align="right">{station.rxRate} Mbps</TableCell>
+                                  <TableCell align="right">{station.txRate} Mbps</TableCell>
+                                  <TableCell align="right">{formatBytes(station.rxBytes)}</TableCell>
+                                  <TableCell align="right">{formatBytes(station.txBytes)}</TableCell>
+                                </TableRow>
+                              );
+                            })}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    </Box>
+                  )}
+                </Collapse>
                 <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
                   {iface.running ? (
                     <>

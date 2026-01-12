@@ -44,6 +44,7 @@ import {
 } from 'recharts';
 import { client } from '../api/client';
 import type { InterfaceRates, LatencyStats, WiFiClientRates, AggregatedStats, WiFiClientAggregatedStats } from '../api/client';
+import { useQuery } from '../api/hooks';
 
 // Generate a consistent color for a MAC address
 function getMacColor(_mac: string, index: number): string {
@@ -57,7 +58,7 @@ function getMacColor(_mac: string, index: number): string {
 
 // Format bytes to human readable
 function formatBytes(bytes: number, decimals = 2): string {
-  if (bytes === 0) return '0 B';
+  if (!bytes || isNaN(bytes) || bytes <= 0) return '0 B';
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
@@ -66,7 +67,7 @@ function formatBytes(bytes: number, decimals = 2): string {
 
 // Format bytes per second
 function formatBps(bps: number): string {
-  if (bps === 0) return '0 B/s';
+  if (!bps || isNaN(bps) || bps <= 0) return '0 B/s';
   const k = 1024;
   const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
   const i = Math.floor(Math.log(bps) / Math.log(k));
@@ -127,6 +128,18 @@ function StatsPage() {
   const [wifiClients, setWifiClients] = useState<WiFiClientRates[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Fetch devices for name lookup
+  const { data: devicesData } = useQuery('listDevices');
+
+  // Get display name for a MAC address from devices database
+  const getDeviceName = (mac: string): string | null => {
+    const device = devicesData?.devices?.find(
+      d => d.mac.toLowerCase() === mac.toLowerCase()
+    );
+    if (!device) return null;
+    return device.display_name || device.hostname || null;
+  };
 
   const fetchStats = useCallback(async () => {
     try {
@@ -694,17 +707,18 @@ function StatsPage() {
                     // Build pie data for WiFi clients
                     const pieData: Array<{ name: string; value: number; color: string }> = [];
                     wifiClients.forEach((wifiClient, index) => {
-                      const shortMac = wifiClient.mac.slice(-8);
+                      const deviceName = getDeviceName(wifiClient.mac);
+                      const displayName = deviceName || wifiClient.mac.toUpperCase().slice(-8);
                       if (wifiClient.total_rx_bytes > 0) {
                         pieData.push({
-                          name: `${shortMac} ↓`,
+                          name: `${displayName} ↓`,
                           value: wifiClient.total_rx_bytes,
                           color: getMacColor(wifiClient.mac, index * 2),
                         });
                       }
                       if (wifiClient.total_tx_bytes > 0) {
                         pieData.push({
-                          name: `${shortMac} ↑`,
+                          name: `${displayName} ↑`,
                           value: wifiClient.total_tx_bytes,
                           color: getMacColor(wifiClient.mac, index * 2 + 1),
                         });
@@ -851,10 +865,20 @@ function StatsPage() {
                       </TableRow>
                       {wifiClients.map((wifiClient) => {
                         const signalQuality = getSignalQuality(wifiClient.signal);
+                        const deviceName = getDeviceName(wifiClient.mac);
                         return (
                           <TableRow key={wifiClient.mac}>
                             <TableCell>
-                              <code>{wifiClient.mac}</code>
+                              {deviceName ? (
+                                <>
+                                  <Typography variant="body2">{deviceName}</Typography>
+                                  <Typography variant="caption" color="text.secondary">
+                                    <code>{wifiClient.mac.toUpperCase()}</code>
+                                  </Typography>
+                                </>
+                              ) : (
+                                <code>{wifiClient.mac.toUpperCase()}</code>
+                              )}
                             </TableCell>
                             <TableCell>
                               <code>{wifiClient.interface}</code>
@@ -988,14 +1012,18 @@ function StatsPage() {
                               const strName = String(name);
                               const mac = strName.replace(/_[rt]x$/, '');
                               const direction = strName.endsWith('_rx') ? '↓' : '↑';
-                              return [formatBps(numValue), `${mac} ${direction}`];
+                              const deviceName = getDeviceName(mac);
+                              const displayName = deviceName || mac.toUpperCase().slice(-8);
+                              return [formatBps(numValue), `${displayName} ${direction}`];
                             }}
                           />
                           <Legend
                             formatter={(value: string) => {
                               const mac = value.replace(/_[rt]x$/, '');
                               const direction = value.endsWith('_rx') ? '↓' : '↑';
-                              return `${mac.slice(-8)} ${direction}`;
+                              const deviceName = getDeviceName(mac);
+                              const displayName = deviceName || mac.toUpperCase().slice(-8);
+                              return `${displayName} ${direction}`;
                             }}
                           />
                           {uniqueMacs.flatMap((mac, index) => [

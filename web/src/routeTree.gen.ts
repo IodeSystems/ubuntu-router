@@ -18,7 +18,6 @@ import { Route as SetupRouteImport } from './routes/setup'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as ServicesRouteImport } from './routes/services'
 import { Route as QosRouteImport } from './routes/qos'
-import { Route as MultiwanRouteImport } from './routes/multiwan'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as InterfacesRouteImport } from './routes/interfaces'
 import { Route as FirewallRouteImport } from './routes/firewall'
@@ -72,11 +71,6 @@ const QosRoute = QosRouteImport.update({
   path: '/qos',
   getParentRoute: () => rootRouteImport,
 } as any)
-const MultiwanRoute = MultiwanRouteImport.update({
-  id: '/multiwan',
-  path: '/multiwan',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
@@ -121,7 +115,6 @@ export interface FileRoutesByFullPath {
   '/firewall': typeof FirewallRoute
   '/interfaces': typeof InterfacesRoute
   '/login': typeof LoginRoute
-  '/multiwan': typeof MultiwanRoute
   '/qos': typeof QosRoute
   '/services': typeof ServicesRoute
   '/settings': typeof SettingsRoute
@@ -140,7 +133,6 @@ export interface FileRoutesByTo {
   '/firewall': typeof FirewallRoute
   '/interfaces': typeof InterfacesRoute
   '/login': typeof LoginRoute
-  '/multiwan': typeof MultiwanRoute
   '/qos': typeof QosRoute
   '/services': typeof ServicesRoute
   '/settings': typeof SettingsRoute
@@ -160,7 +152,6 @@ export interface FileRoutesById {
   '/firewall': typeof FirewallRoute
   '/interfaces': typeof InterfacesRoute
   '/login': typeof LoginRoute
-  '/multiwan': typeof MultiwanRoute
   '/qos': typeof QosRoute
   '/services': typeof ServicesRoute
   '/settings': typeof SettingsRoute
@@ -181,7 +172,6 @@ export interface FileRouteTypes {
     | '/firewall'
     | '/interfaces'
     | '/login'
-    | '/multiwan'
     | '/qos'
     | '/services'
     | '/settings'
@@ -200,7 +190,6 @@ export interface FileRouteTypes {
     | '/firewall'
     | '/interfaces'
     | '/login'
-    | '/multiwan'
     | '/qos'
     | '/services'
     | '/settings'
@@ -219,7 +208,6 @@ export interface FileRouteTypes {
     | '/firewall'
     | '/interfaces'
     | '/login'
-    | '/multiwan'
     | '/qos'
     | '/services'
     | '/settings'
@@ -239,7 +227,6 @@ export interface RootRouteChildren {
   FirewallRoute: typeof FirewallRoute
   InterfacesRoute: typeof InterfacesRoute
   LoginRoute: typeof LoginRoute
-  MultiwanRoute: typeof MultiwanRoute
   QosRoute: typeof QosRoute
   ServicesRoute: typeof ServicesRoute
   SettingsRoute: typeof SettingsRoute
@@ -316,13 +303,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof QosRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/multiwan': {
-      id: '/multiwan'
-      path: '/multiwan'
-      fullPath: '/multiwan'
-      preLoaderRoute: typeof MultiwanRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/login': {
       id: '/login'
       path: '/login'
@@ -383,7 +363,6 @@ const rootRouteChildren: RootRouteChildren = {
   FirewallRoute: FirewallRoute,
   InterfacesRoute: InterfacesRoute,
   LoginRoute: LoginRoute,
-  MultiwanRoute: MultiwanRoute,
   QosRoute: QosRoute,
   ServicesRoute: ServicesRoute,
   SettingsRoute: SettingsRoute,

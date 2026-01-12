@@ -29,9 +29,22 @@ function DHCPPage() {
   const { data: leasesData, isLoading: leasesLoading } = useQuery('listLeases');
   const { data: reservationsData, isLoading: reservationsLoading, refetch } = useQuery('listReservations');
   const { data: settingsData, isLoading: settingsLoading, refetch: refetchSettings } = useQuery('getDHCPSettings');
+  const { data: devicesData } = useQuery('listDevices');
   const { mutate: addReservation, isLoading: isAdding } = useMutation('addReservation');
   const { mutate: removeReservation, isLoading: isRemoving } = useMutation('removeReservation');
   const { mutate: updateSettings, isLoading: isSaving } = useMutation('updateDHCPSettings');
+
+  // Get device info for a MAC address from devices database
+  const getDeviceInfo = (mac: string): { displayName: string | null; hostname: string | null } => {
+    const device = devicesData?.devices?.find(
+      d => d.mac.toLowerCase() === mac.toLowerCase()
+    );
+    if (!device) return { displayName: null, hostname: null };
+    return {
+      displayName: device.display_name || null,
+      hostname: device.hostname || null,
+    };
+  };
 
   const [name, setName] = useState('');
   const [mac, setMac] = useState('');
@@ -259,9 +272,11 @@ function DHCPPage() {
                     const rows = Array.from(allMacs).map((mac) => {
                       const reservation = reservationsByMac.get(mac);
                       const lease = leasesByMac.get(mac);
+                      const deviceInfo = getDeviceInfo(mac);
                       return {
                         mac: reservation?.mac || lease?.mac || mac,
-                        name: reservation?.name || lease?.hostname || '',
+                        // Priority: reservation name > device display_name > device hostname > lease hostname
+                        name: reservation?.name || deviceInfo.displayName || deviceInfo.hostname || lease?.hostname || '',
                         ip: reservation?.ip || lease?.ip || '',
                         isStatic: !!reservation,
                         hasLease: !!lease,
@@ -288,7 +303,7 @@ function DHCPPage() {
                       <TableRow key={row.mac}>
                         <TableCell>{row.name || <Typography color="text.secondary" component="span">—</Typography>}</TableCell>
                         <TableCell><code>{row.ip}</code></TableCell>
-                        <TableCell><code>{row.mac}</code></TableCell>
+                        <TableCell><code>{row.mac.toUpperCase()}</code></TableCell>
                         <TableCell>
                           {row.isStatic ? (
                             <Chip label="Static" size="small" color="primary" />

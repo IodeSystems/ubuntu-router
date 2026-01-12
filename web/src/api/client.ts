@@ -327,22 +327,39 @@ interface WiFiConnectRequest {
 
 // Multi-WAN types
 export interface WANConfigItem {
+  id?: string;
   name: string;
   interface: string;
   enabled: boolean;
   priority: number;
-  mode: 'dhcp' | 'static' | 'wifi';
+  mode?: 'dhcp' | 'static' | 'wifi';
   static_ip?: string;
   static_gateway?: string;
   static_dns?: string;
   wifi_ssid?: string;
   wifi_password?: string;
   wifi_security?: string;
-  health_check_enabled: boolean;
-  health_check_targets?: string[];
+  fuse_with_next?: boolean; // Load balancing (WIP)
   health_check_interval?: number;
   health_check_timeout?: number;
   health_check_retries?: number;
+  health_check_targets?: string[];
+}
+
+export interface InterfaceStats {
+  rx_bytes: number;
+  tx_bytes: number;
+  rx_packets: number;
+  tx_packets: number;
+}
+
+export interface WANsResponse {
+  wans: WANConfigItem[];
+  failback_delay: number;
+  status: MultiWANStatus;
+  interface_stats: Record<string, InterfaceStats>;
+  interface_routes: Record<string, string[]>;
+  interface_dns: Record<string, string[]>;
 }
 
 export interface MultiWANConfig {
@@ -1180,6 +1197,21 @@ export const client = {
     apiCall<ApiResponse>('/multiwan/configure', 'POST', params),
   switchMultiWAN: (params: { interface: string }) =>
     apiCall<ApiResponse>('/multiwan/switch', 'POST', params),
+
+  // WAN List Management (unified WAN management)
+  getWANs: () => apiCall<WANsResponse>('/wans'),
+  addWAN: (params: Omit<WANConfigItem, 'id'>) =>
+    apiCall<WANConfigItem>('/wans', 'POST', params),
+  updateWAN: (params: { id: string; wan: Partial<WANConfigItem> }) =>
+    apiCall<WANConfigItem>(`/wans/${params.id}`, 'PUT', params.wan),
+  deleteWAN: (id: string) =>
+    apiCall<ApiResponse>(`/wans/${id}`, 'DELETE'),
+  reorderWANs: (params: { order: string[] }) =>
+    apiCall<WANConfigItem[]>('/wans/reorder', 'POST', params),
+  autoDetectWANs: () =>
+    apiCall<{ message: string; added: WANConfigItem[] }>('/wans/autodetect', 'POST'),
+  refreshWANDHCP: (id: string) =>
+    apiCall<{ success: boolean; message: string; output: string }>(`/wans/${id}/refresh-dhcp`, 'POST'),
 
   // System
   getSystemDependencies: () => apiCall<SystemDependenciesResponse>('/system/dependencies'),

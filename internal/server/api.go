@@ -1454,6 +1454,14 @@ func (s *Server) handleAPIWiFiConfigure(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Check if this interface is already configured as a WAN
+	for _, wan := range s.config.WANs {
+		if wan.Interface == cfg.Interface {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("Interface %s is already configured as a WAN. Remove it from WAN list first.", cfg.Interface))
+			return
+		}
+	}
+
 	// Auto-generate SSID if not provided
 	if cfg.SSID == "" {
 		cfg.SSID = config.GenerateSSID()
@@ -2420,7 +2428,7 @@ func (s *Server) handleAPIMultiWANStatus(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, status)
 }
 
-// /api/multiwan/configure - POST configure multi-WAN
+// /api/multiwan/configure - POST configure multi-WAN (updates WANs list in config)
 func (s *Server) handleAPIMultiWANConfigure(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -2430,96 +2438,66 @@ func (s *Server) handleAPIMultiWANConfigure(w http.ResponseWriter, r *http.Reque
 	ctx, cancel := s.ctx(r)
 	defer cancel()
 
-	var cfg config.MultiWANConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	var req struct {
+		WANs          []config.WANConfig `json:"wans"`
+		FailbackDelay int                `json:"failback_delay"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Auto-add current WAN interface if configured and not already in the list
-	if s.config.WANInterface != "" && cfg.Enabled {
-		found := false
-		for _, wan := range cfg.WANs {
-			if wan.Interface == s.config.WANInterface {
-				found = true
-				break
-			}
-		}
-		if !found {
-			// Add current WAN as primary (priority 0)
-			currentWAN := config.WANConfig{
-				Name:                "Primary",
-				Interface:           s.config.WANInterface,
-				Enabled:             true,
-				Priority:            0,
-				Mode:                s.config.WANMode,
-				StaticIP:            s.config.WANStaticIP,
-				StaticGateway:       s.config.WANStaticGateway,
-				StaticDNS:           s.config.WANStaticDNS,
-				WiFiSSID:            s.config.WANWiFiSSID,
-				WiFiPassword:        s.config.WANWiFiPassword,
-				WiFiSecurity:        s.config.WANWiFiSecurity,
-				HealthCheckInterval: 10,
-				HealthCheckTimeout:  5,
-				HealthCheckRetries:  3,
-			}
-			// Shift existing priorities
-			for i := range cfg.WANs {
-				cfg.WANs[i].Priority++
-			}
-			cfg.WANs = append([]config.WANConfig{currentWAN}, cfg.WANs...)
-			logger.Info("Multi-WAN: Auto-added current WAN %s as primary", s.config.WANInterface)
-		}
-	}
-
-	// Validate WANs
-	for i, wan := range cfg.WANs {
+	// Validate and set defaults for WANs
+	for i := range req.WANs {
+		wan := &req.WANs[i]
 		if wan.Interface == "" {
 			writeError(w, http.StatusBadRequest, "WAN interface is required")
 			return
 		}
-		if wan.Name == "" {
-			cfg.WANs[i].Name = wan.Interface
+		// Generate ID if not provided
+		if wan.ID == "" {
+			wan.ID = config.GenerateWANID()
 		}
-		// Set defaults
+		if wan.Name == "" {
+			wan.Name = wan.Interface
+		}
+		// Set health check defaults
 		if wan.HealthCheckInterval <= 0 {
-			cfg.WANs[i].HealthCheckInterval = 10
+			wan.HealthCheckInterval = 10
 		}
 		if wan.HealthCheckTimeout <= 0 {
-			cfg.WANs[i].HealthCheckTimeout = 5
+			wan.HealthCheckTimeout = 5
 		}
 		if wan.HealthCheckRetries <= 0 {
-			cfg.WANs[i].HealthCheckRetries = 3
+			wan.HealthCheckRetries = 3
 		}
 	}
 
-	if cfg.FailbackDelay <= 0 {
-		cfg.FailbackDelay = 60
-	}
-	if cfg.Mode == "" {
-		cfg.Mode = "failover"
+	if req.FailbackDelay <= 0 {
+		req.FailbackDelay = 60
 	}
 
 	// Update config
-	s.config.MultiWAN = &cfg
+	s.config.WANs = req.WANs
+	s.config.FailbackDelay = req.FailbackDelay
 	if err := s.saveConfig(); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to save config: "+err.Error())
 		return
 	}
 
-	// Reconfigure and restart if needed
+	// Reconfigure and restart the multi-WAN manager
 	s.multiwan.Stop()
-	s.multiwan.Configure(&cfg)
+	s.multiwan.Configure(s.config)
 
-	if cfg.Enabled {
+	if len(req.WANs) > 0 {
 		if err := s.multiwan.Start(ctx); err != nil {
 			writeError(w, http.StatusInternalServerError, "Failed to start multi-WAN: "+err.Error())
 			return
 		}
 	}
 
-	logger.Info("Multi-WAN configured: enabled=%v mode=%s wans=%d", cfg.Enabled, cfg.Mode, len(cfg.WANs))
-	writeSuccess(w, "Multi-WAN configuration updated")
+	logger.Info("WAN configuration updated: wans=%d failback_delay=%d", len(req.WANs), req.FailbackDelay)
+	writeSuccess(w, "WAN configuration updated")
 }
 
 // /api/multiwan/switch - POST force switch to specific WAN
@@ -2552,6 +2530,550 @@ func (s *Server) handleAPIMultiWANSwitch(w http.ResponseWriter, r *http.Request)
 
 	logger.Info("Multi-WAN: forced switch to %s", req.Interface)
 	writeSuccess(w, "Switched to "+req.Interface)
+}
+
+// /api/wans - GET list all WANs, POST add a new WAN
+func (s *Server) handleAPIWANs(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := s.ctx(r)
+	defer cancel()
+
+	switch r.Method {
+	case http.MethodGet:
+		// Return list of configured WANs with status
+		status := s.multiwan.GetStatus()
+
+		// Add interface stats to each WAN in the status
+		if status != nil && len(status.WANs) > 0 {
+			for i := range status.WANs {
+				ifaceStats, err := s.stats.GetInterfaceStats(ctx, status.WANs[i].Interface)
+				if err == nil && ifaceStats != nil {
+					// Add stats as extra fields (we'll use a map to add these)
+				}
+			}
+		}
+
+		// Get interface stats, routes, and DNS for all WANs
+		ifaceStats := make(map[string]map[string]interface{})
+		ifaceRoutes := make(map[string][]string)
+		ifaceDNS := make(map[string][]string)
+
+		for _, wan := range s.config.WANs {
+			// Get interface stats
+			stats, err := s.stats.GetInterfaceStats(ctx, wan.Interface)
+			if err == nil && stats != nil {
+				ifaceStats[wan.Interface] = map[string]interface{}{
+					"rx_bytes":   stats.RxBytes,
+					"tx_bytes":   stats.TxBytes,
+					"rx_packets": stats.RxPackets,
+					"tx_packets": stats.TxPackets,
+				}
+			}
+
+			// Get routes for this interface
+			routeOutput, err := s.runner.Run(ctx, "ip", "route", "show", "dev", wan.Interface)
+			if err == nil {
+				routes := strings.Split(strings.TrimSpace(string(routeOutput)), "\n")
+				var cleanRoutes []string
+				for _, r := range routes {
+					r = strings.TrimSpace(r)
+					if r != "" {
+						cleanRoutes = append(cleanRoutes, r)
+					}
+				}
+				ifaceRoutes[wan.Interface] = cleanRoutes
+			}
+
+			// Get DNS servers (try resolvectl first, fall back to static config)
+			dnsOutput, err := s.runner.Run(ctx, "resolvectl", "dns", wan.Interface)
+			if err == nil {
+				// Parse: "Link 2 (eth0): 192.168.1.1 8.8.8.8"
+				line := strings.TrimSpace(string(dnsOutput))
+				if idx := strings.Index(line, "):"); idx != -1 {
+					dnsStr := strings.TrimSpace(line[idx+2:])
+					if dnsStr != "" {
+						ifaceDNS[wan.Interface] = strings.Fields(dnsStr)
+					}
+				}
+			} else if wan.StaticDNS != "" {
+				// Use static DNS from config
+				ifaceDNS[wan.Interface] = strings.Split(wan.StaticDNS, ",")
+			}
+		}
+
+		writeJSON(w, map[string]interface{}{
+			"wans":            s.config.WANs,
+			"failback_delay":  s.config.FailbackDelay,
+			"status":          status,
+			"interface_stats": ifaceStats,
+			"interface_routes": ifaceRoutes,
+			"interface_dns":   ifaceDNS,
+		})
+
+	case http.MethodPost:
+		// Add a new WAN
+		var wan config.WANConfig
+		if err := json.NewDecoder(r.Body).Decode(&wan); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		if wan.Interface == "" {
+			writeError(w, http.StatusBadRequest, "interface is required")
+			return
+		}
+
+		// Check if this interface is already configured as a WiFi AP
+		for _, wifi := range s.config.WiFiInterfaces {
+			if wifi.Interface == wan.Interface {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("Interface %s is already configured as a WiFi AP. Remove it from WiFi AP list first.", wan.Interface))
+				return
+			}
+		}
+
+		// Generate ID if not provided
+		if wan.ID == "" {
+			wan.ID = config.GenerateWANID()
+		}
+		if wan.Name == "" {
+			wan.Name = wan.Interface
+		}
+
+		// Set defaults
+		if wan.HealthCheckInterval <= 0 {
+			wan.HealthCheckInterval = 10
+		}
+		if wan.HealthCheckTimeout <= 0 {
+			wan.HealthCheckTimeout = 5
+		}
+		if wan.HealthCheckRetries <= 0 {
+			wan.HealthCheckRetries = 3
+		}
+		if wan.Priority <= 0 {
+			// Set priority to be after all existing WANs
+			maxPriority := 0
+			for _, w := range s.config.WANs {
+				if w.Priority > maxPriority {
+					maxPriority = w.Priority
+				}
+			}
+			wan.Priority = maxPriority + 1
+		}
+
+		// If WiFi mode, connect to the network
+		if wan.Mode == "wifi" && wan.WiFiSSID != "" {
+			security := wan.WiFiSecurity
+			if security == "" {
+				security = "wpa2"
+			}
+			if err := s.wifi.ConnectToNetwork(ctx, wan.Interface, wan.WiFiSSID, wan.WiFiPassword, security); err != nil {
+				writeError(w, http.StatusInternalServerError, "Failed to connect to WiFi: "+err.Error())
+				return
+			}
+			// Create wpa_supplicant service for persistence
+			if err := s.wifi.WriteWpaSupplicantService(wan.Interface); err != nil {
+				logger.Warn("Failed to create wpa_supplicant service: %v", err)
+			} else {
+				s.runner.Run(ctx, "systemctl", "daemon-reload")
+				s.wifi.EnableWpaSupplicant(ctx, wan.Interface)
+			}
+		}
+
+		// Add to config
+		s.config.WANs = append(s.config.WANs, wan)
+		if err := s.saveConfig(); err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to save config: "+err.Error())
+			return
+		}
+
+		// Reconfigure multi-WAN manager
+		s.multiwan.Stop()
+		s.multiwan.Configure(s.config)
+		if err := s.multiwan.Start(ctx); err != nil {
+			logger.Warn("Failed to restart multi-WAN: %v", err)
+		}
+
+		logger.Info("WAN added: %s (%s)", wan.Name, wan.Interface)
+		writeJSON(w, wan)
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+	}
+}
+
+// /api/wans/{id} - GET/PUT/DELETE a specific WAN by ID
+func (s *Server) handleAPIWANByID(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := s.ctx(r)
+	defer cancel()
+
+	// Extract ID from path: /api/wans/{id} or /api/wans/{id}/refresh-dhcp
+	path := strings.TrimPrefix(r.URL.Path, "/api/wans/")
+	path = strings.TrimSuffix(path, "/")
+
+	// Handle /api/wans/{id}/refresh-dhcp
+	if strings.HasSuffix(path, "/refresh-dhcp") {
+		s.handleAPIWANRefreshDHCP(w, r)
+		return
+	}
+
+	id := path
+	if id == "" || id == "reorder" || id == "autodetect" {
+		writeError(w, http.StatusBadRequest, "WAN ID is required")
+		return
+	}
+
+	// Find the WAN by ID
+	wanIndex := -1
+	for i, wan := range s.config.WANs {
+		if wan.ID == id {
+			wanIndex = i
+			break
+		}
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		if wanIndex == -1 {
+			writeError(w, http.StatusNotFound, "WAN not found")
+			return
+		}
+		// Return the WAN with its status
+		wan := s.config.WANs[wanIndex]
+		status := s.multiwan.GetStatus()
+		var wanStatus interface{}
+		for _, ws := range status.WANs {
+			if ws.Interface == wan.Interface {
+				wanStatus = ws
+				break
+			}
+		}
+		writeJSON(w, map[string]interface{}{
+			"wan":    wan,
+			"status": wanStatus,
+		})
+
+	case http.MethodPut:
+		if wanIndex == -1 {
+			writeError(w, http.StatusNotFound, "WAN not found")
+			return
+		}
+		// Update the WAN
+		var wan config.WANConfig
+		if err := json.NewDecoder(r.Body).Decode(&wan); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Preserve the ID
+		wan.ID = id
+		if wan.Interface == "" {
+			writeError(w, http.StatusBadRequest, "interface is required")
+			return
+		}
+
+		// Check if this interface is already configured as a WiFi AP
+		for _, wifi := range s.config.WiFiInterfaces {
+			if wifi.Interface == wan.Interface {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("Interface %s is already configured as a WiFi AP. Remove it from WiFi AP list first.", wan.Interface))
+				return
+			}
+		}
+
+		if wan.Name == "" {
+			wan.Name = wan.Interface
+		}
+
+		// If WiFi mode, connect to the network
+		if wan.Mode == "wifi" && wan.WiFiSSID != "" {
+			security := wan.WiFiSecurity
+			if security == "" {
+				security = "wpa2"
+			}
+			if err := s.wifi.ConnectToNetwork(ctx, wan.Interface, wan.WiFiSSID, wan.WiFiPassword, security); err != nil {
+				writeError(w, http.StatusInternalServerError, "Failed to connect to WiFi: "+err.Error())
+				return
+			}
+			// Create wpa_supplicant service for persistence
+			if err := s.wifi.WriteWpaSupplicantService(wan.Interface); err != nil {
+				logger.Warn("Failed to create wpa_supplicant service: %v", err)
+			} else {
+				s.runner.Run(ctx, "systemctl", "daemon-reload")
+				s.wifi.EnableWpaSupplicant(ctx, wan.Interface)
+			}
+		}
+
+		s.config.WANs[wanIndex] = wan
+		if err := s.saveConfig(); err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to save config: "+err.Error())
+			return
+		}
+
+		// Reconfigure multi-WAN manager
+		s.multiwan.Stop()
+		s.multiwan.Configure(s.config)
+		if err := s.multiwan.Start(ctx); err != nil {
+			logger.Warn("Failed to restart multi-WAN: %v", err)
+		}
+
+		logger.Info("WAN updated: %s (%s)", wan.Name, wan.Interface)
+		writeJSON(w, wan)
+
+	case http.MethodDelete:
+		if wanIndex == -1 {
+			writeError(w, http.StatusNotFound, "WAN not found")
+			return
+		}
+		// Remove the WAN
+		removed := s.config.WANs[wanIndex]
+		s.config.WANs = append(s.config.WANs[:wanIndex], s.config.WANs[wanIndex+1:]...)
+		if err := s.saveConfig(); err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to save config: "+err.Error())
+			return
+		}
+
+		// Reconfigure multi-WAN manager
+		s.multiwan.Stop()
+		s.multiwan.Configure(s.config)
+		if len(s.config.WANs) > 0 {
+			if err := s.multiwan.Start(ctx); err != nil {
+				logger.Warn("Failed to restart multi-WAN: %v", err)
+			}
+		}
+
+		logger.Info("WAN removed: %s (%s)", removed.Name, removed.Interface)
+		writeSuccess(w, "WAN removed")
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+	}
+}
+
+// /api/wans/reorder - POST reorder WANs by priority
+func (s *Server) handleAPIWANsReorder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	ctx, cancel := s.ctx(r)
+	defer cancel()
+
+	var req struct {
+		Order []string `json:"order"` // List of WAN IDs in desired order
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if len(req.Order) != len(s.config.WANs) {
+		writeError(w, http.StatusBadRequest, "order must contain all WAN IDs")
+		return
+	}
+
+	// Build a map of ID to WAN config
+	wanMap := make(map[string]config.WANConfig)
+	for _, wan := range s.config.WANs {
+		wanMap[wan.ID] = wan
+	}
+
+	// Reorder WANs based on the order list
+	newWANs := make([]config.WANConfig, 0, len(req.Order))
+	for i, id := range req.Order {
+		wan, ok := wanMap[id]
+		if !ok {
+			writeError(w, http.StatusBadRequest, "unknown WAN ID: "+id)
+			return
+		}
+		wan.Priority = i + 1
+		newWANs = append(newWANs, wan)
+	}
+
+	s.config.WANs = newWANs
+	if err := s.saveConfig(); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to save config: "+err.Error())
+		return
+	}
+
+	// Reconfigure multi-WAN manager
+	s.multiwan.Stop()
+	s.multiwan.Configure(s.config)
+	if len(s.config.WANs) > 0 {
+		if err := s.multiwan.Start(ctx); err != nil {
+			logger.Warn("Failed to restart multi-WAN: %v", err)
+		}
+	}
+
+	logger.Info("WANs reordered: %v", req.Order)
+	writeJSON(w, s.config.WANs)
+}
+
+// /api/wans/autodetect - POST auto-detect and add WAN interfaces
+func (s *Server) handleAPIWANsAutoDetect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	ctx, cancel := s.ctx(r)
+	defer cancel()
+
+	// Get all interfaces
+	interfaces, err := s.network.ListInterfaces(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to get interfaces: "+err.Error())
+		return
+	}
+
+	// Track already configured interfaces
+	configured := make(map[string]bool)
+	for _, wan := range s.config.WANs {
+		configured[wan.Interface] = true
+	}
+
+	// Track interfaces used for WiFi AP
+	wifiAPInterfaces := make(map[string]bool)
+	for _, wifi := range s.config.WiFiInterfaces {
+		wifiAPInterfaces[wifi.Interface] = true
+	}
+
+	// Find interfaces that could be WANs
+	var added []config.WANConfig
+	priority := len(s.config.WANs) + 1
+
+	for _, iface := range interfaces {
+		// Skip already configured, loopback, bridge, wireguard, and veth interfaces
+		if configured[iface.Name] {
+			continue
+		}
+		if iface.Name == "lo" || iface.Name == s.config.LANBridge {
+			continue
+		}
+		if strings.HasPrefix(iface.Name, "wg") || strings.HasPrefix(iface.Name, "veth") {
+			continue
+		}
+		if strings.HasPrefix(iface.Name, "br") || strings.HasPrefix(iface.Name, "docker") {
+			continue
+		}
+		// Skip WiFi interfaces used for AP
+		if wifiAPInterfaces[iface.Name] {
+			continue
+		}
+
+		// Check if it's an ethernet or wifi interface
+		isEthernet := iface.Type == "ethernet"
+		isWiFi := iface.Type == "wifi" || strings.HasPrefix(iface.Name, "wl")
+
+		if !isEthernet && !isWiFi {
+			continue
+		}
+
+		// Create WAN config
+		wan := config.WANConfig{
+			ID:                  config.GenerateWANID(),
+			Name:                iface.Name,
+			Interface:           iface.Name,
+			Enabled:             true,
+			Priority:            priority,
+			Mode:                "dhcp",
+			HealthCheckInterval: 10,
+			HealthCheckTimeout:  5,
+			HealthCheckRetries:  3,
+			HealthCheckTargets:  []string{"8.8.8.8", "1.1.1.1"},
+		}
+
+		if isWiFi {
+			wan.Mode = "wifi"
+		}
+
+		s.config.WANs = append(s.config.WANs, wan)
+		added = append(added, wan)
+		priority++
+		logger.Info("WAN auto-detected: %s (priority %d)", iface.Name, wan.Priority)
+	}
+
+	if len(added) == 0 {
+		writeJSON(w, map[string]interface{}{
+			"message": "No new WAN interfaces detected",
+			"added":   []config.WANConfig{},
+		})
+		return
+	}
+
+	// Save config
+	if err := s.saveConfig(); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to save config: "+err.Error())
+		return
+	}
+
+	// Reconfigure multi-WAN manager
+	s.multiwan.Stop()
+	s.multiwan.Configure(s.config)
+	if err := s.multiwan.Start(ctx); err != nil {
+		logger.Warn("Failed to restart multi-WAN: %v", err)
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"message": fmt.Sprintf("Added %d WAN interface(s)", len(added)),
+		"added":   added,
+	})
+}
+
+// /api/wans/{id}/refresh-dhcp - POST refresh DHCP on a WAN interface
+func (s *Server) handleAPIWANRefreshDHCP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	ctx, cancel := s.ctx(r)
+	defer cancel()
+
+	// Extract ID from path: /api/wans/{id}/refresh-dhcp
+	path := strings.TrimPrefix(r.URL.Path, "/api/wans/")
+	path = strings.TrimSuffix(path, "/refresh-dhcp")
+	id := path
+
+	// Find the WAN by ID
+	var wan *config.WANConfig
+	for i := range s.config.WANs {
+		if s.config.WANs[i].ID == id {
+			wan = &s.config.WANs[i]
+			break
+		}
+	}
+
+	if wan == nil {
+		writeError(w, http.StatusNotFound, "WAN not found")
+		return
+	}
+
+	// Only works for DHCP mode
+	if wan.Mode != "dhcp" && wan.Mode != "" {
+		writeError(w, http.StatusBadRequest, "WAN is not in DHCP mode")
+		return
+	}
+
+	iface := wan.Interface
+
+	// Release current DHCP lease
+	_, _ = s.runner.Run(ctx, "dhclient", "-r", iface)
+
+	// Request new DHCP lease
+	output, err := s.runner.Run(ctx, "dhclient", "-v", iface)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to refresh DHCP: "+err.Error())
+		return
+	}
+
+	logger.Info("DHCP refreshed on %s: %s", iface, string(output))
+
+	// Get new IP info
+	ipOutput, _ := s.runner.Run(ctx, "ip", "-4", "addr", "show", iface)
+
+	writeJSON(w, map[string]interface{}{
+		"success": true,
+		"message": "DHCP lease refreshed on " + iface,
+		"output":  string(ipOutput),
+	})
 }
 
 // /api/health/fix - POST run a fixer

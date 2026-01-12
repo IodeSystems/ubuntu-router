@@ -10,6 +10,7 @@ import (
 	"github.com/iodesystems/ubuntu-router/internal/config"
 	"github.com/iodesystems/ubuntu-router/internal/dnsmasq"
 	"github.com/iodesystems/ubuntu-router/internal/haproxy"
+	"github.com/iodesystems/ubuntu-router/internal/health"
 	"github.com/iodesystems/ubuntu-router/internal/multiwan"
 	"github.com/iodesystems/ubuntu-router/internal/system"
 	"github.com/iodesystems/ubuntu-router/internal/wifi"
@@ -18,6 +19,7 @@ import (
 
 // Bootstrap applies essential router configuration on startup.
 // This ensures the router works after reboot without manual intervention.
+// Uses the health check system with auto-fix for self-healing.
 type Bootstrap struct {
 	runner       system.CommandRunner
 	fs           system.FileSystem
@@ -28,10 +30,63 @@ type Bootstrap struct {
 	wifi         *wifi.Manager
 	haproxy      *haproxy.Manager
 	multiwan     *multiwan.Manager
+	healthRunner *health.Runner
 }
 
 // New creates a new Bootstrap instance
 func New(runner system.CommandRunner, fs system.FileSystem, cfg *config.Config, wireguardP2P *wireguard.P2PManager) *Bootstrap {
+	// Create health runner
+	healthRunner := health.NewRunner(runner, fs)
+
+	// Build WireGuard interface configs for health checks
+	var wgInterfaces []health.WireGuardInterfaceConfig
+	if cfg.WireGuard != nil && cfg.WireGuard.Enabled {
+		iface := cfg.WireGuard.Interface
+		if iface == "" {
+			iface = "wg0"
+		}
+		configPath := cfg.WireGuard.ConfigPath
+		if configPath == "" {
+			configPath = fmt.Sprintf("/etc/wireguard/%s.conf", iface)
+		}
+		wgInterfaces = append(wgInterfaces, health.WireGuardInterfaceConfig{
+			Name:       iface,
+			ConfigPath: configPath,
+			Enabled:    true,
+		})
+	}
+	if cfg.WireGuardP2P != nil {
+		for _, t := range cfg.WireGuardP2P.Tunnels {
+			if t.Enabled && t.Interface != "" {
+				wgInterfaces = append(wgInterfaces, health.WireGuardInterfaceConfig{
+					Name:       t.Interface,
+					ConfigPath: fmt.Sprintf("/etc/wireguard/%s.conf", t.Interface),
+					Enabled:    true,
+				})
+			}
+		}
+	}
+
+	// Build WiFi AP interface list
+	var wifiAPInterfaces []string
+	for _, wifiCfg := range cfg.WiFiInterfaces {
+		if wifiCfg.Enabled {
+			wifiAPInterfaces = append(wifiAPInterfaces, wifiCfg.Interface)
+		}
+	}
+
+	// Register health checks with router config
+	health.RegisterAllChecksWithConfig(healthRunner, runner, fs, &health.RouterConfig{
+		LANBridge:           cfg.LANBridge,
+		LANAddresses:        cfg.LANAddresses,
+		WANInterface:        cfg.WANInterface,
+		WANMode:             cfg.WANMode,
+		DHCPStart:           cfg.DHCPStart,
+		DHCPEnd:             cfg.DHCPEnd,
+		WireGuardInterfaces: wgInterfaces,
+		WiFiAPInterfaces:    wifiAPInterfaces,
+	})
+
 	return &Bootstrap{
 		runner:       runner,
 		fs:           fs,
@@ -42,74 +97,86 @@ func New(runner system.CommandRunner, fs system.FileSystem, cfg *config.Config, 
 		wifi:         wifi.New(fs, runner),
 		haproxy:      haproxy.New(fs, runner, "/etc/ubuntu-router/certs"),
 		multiwan:     multiwan.New(runner, fs),
+		healthRunner: healthRunner,
 	}
 }
 
-// Run applies all essential startup configuration
+// GetHealthRunner returns the health check runner for external access (API, UI)
+func (b *Bootstrap) GetHealthRunner() *health.Runner {
+	return b.healthRunner
+}
+
+// Run applies all essential startup configuration using the health check system
+// Health checks run asynchronously with auto-fix enabled for self-healing
 func (b *Bootstrap) Run(ctx context.Context) error {
-	log.Println("Running startup bootstrap...")
+	log.Println("Running startup bootstrap with health checks...")
 
-	var errors []string
-
-	// 1. Enable IP forwarding (immediate + persistent)
-	if err := b.enableIPForwarding(ctx); err != nil {
-		errors = append(errors, fmt.Sprintf("IP forwarding: %v", err))
+	// Start health checks with auto-fix asynchronously
+	// This allows the HTTP server to start immediately while fixes are applied
+	err := b.healthRunner.StartAsync(ctx, true, func(status *health.Status, fixResult *health.AutoFixResult) {
+		if status != nil {
+			switch status.State {
+			case health.StateOK:
+				log.Printf("  ✓ %s: %s", status.Name, status.Message)
+			case health.StateWarning:
+				log.Printf("  ⚠ %s: %s", status.Name, status.Message)
+			case health.StateError:
+				log.Printf("  ✗ %s: %s", status.Name, status.Message)
+			case health.StateSkipped:
+				log.Printf("  ⊘ %s: %s", status.Name, status.Message)
+			}
+		}
+		if fixResult != nil {
+			if fixResult.Success {
+				log.Printf("    → Fixed: %s", fixResult.Description)
+			} else {
+				log.Printf("    → Fix failed: %s (%s)", fixResult.Description, fixResult.Error)
+			}
+		}
+	})
+	if err != nil {
+		log.Printf("Warning: failed to start health checks: %v", err)
 	}
 
-	// 2. Load WireGuard kernel module (immediate + persistent)
-	if err := b.loadWireGuardModule(ctx); err != nil {
-		errors = append(errors, fmt.Sprintf("WireGuard module: %v", err))
-	}
+	// Start async background tasks that aren't covered by health checks
+	// These run independently and don't block startup
 
-	// 3. Configure WiFi WAN in background (can take 30+ seconds for WPA3)
-	// This runs asynchronously so the server starts while WiFi is connecting
+	// WiFi WAN connection (can take 30+ seconds for WPA3)
 	go func() {
 		if err := b.configureWiFiWAN(ctx); err != nil {
 			log.Printf("WiFi WAN warning: %v", err)
 		}
 	}()
 
-	// 4. Apply NAT masquerade rules
-	if err := b.applyNATRules(ctx); err != nil {
-		errors = append(errors, fmt.Sprintf("NAT rules: %v", err))
-	}
+	// WireGuard interfaces (may block on DNS resolution)
+	go func() {
+		if err := b.startWireGuardInterfaces(ctx); err != nil {
+			log.Printf("WireGuard interfaces warning: %v", err)
+		}
+	}()
 
-	// 5. Configure LAN bridge (bring up, add IP)
-	if err := b.configureLANBridge(ctx); err != nil {
-		errors = append(errors, fmt.Sprintf("LAN bridge: %v", err))
-	}
+	// WiFi access points
+	go func() {
+		if err := b.configureWiFi(ctx); err != nil {
+			log.Printf("WiFi AP warning: %v", err)
+		}
+	}()
 
-	// 6. Configure dnsmasq (DNS/DHCP) so clients can get IP addresses
-	if err := b.configureDNSMasq(ctx); err != nil {
-		errors = append(errors, fmt.Sprintf("dnsmasq: %v", err))
-	}
+	// HAProxy for services
+	go func() {
+		if err := b.configureHAProxy(ctx); err != nil {
+			log.Printf("HAProxy warning: %v", err)
+		}
+	}()
 
-	// 7. Configure WiFi access points (hostapd)
-	if err := b.configureWiFi(ctx); err != nil {
-		errors = append(errors, fmt.Sprintf("WiFi: %v", err))
-	}
+	// WAN health monitoring (runs continuously)
+	go func() {
+		if err := b.startWANMonitoring(ctx); err != nil {
+			log.Printf("WAN monitoring warning: %v", err)
+		}
+	}()
 
-	// 8. Start WireGuard interfaces and enable auto-start
-	if err := b.startWireGuardInterfaces(ctx); err != nil {
-		errors = append(errors, fmt.Sprintf("WireGuard interfaces: %v", err))
-	}
-
-	// 9. Configure HAProxy (for admin UI access on port 80)
-	if err := b.configureHAProxy(ctx); err != nil {
-		errors = append(errors, fmt.Sprintf("HAProxy: %v", err))
-	}
-
-	// 10. Start WAN health monitoring with auto-failover
-	if err := b.startWANMonitoring(ctx); err != nil {
-		errors = append(errors, fmt.Sprintf("WAN monitoring: %v", err))
-	}
-
-	if len(errors) > 0 {
-		log.Printf("Startup bootstrap completed with warnings: %s", strings.Join(errors, "; "))
-	} else {
-		log.Println("Startup bootstrap completed successfully")
-	}
-
+	log.Println("Startup bootstrap initiated (health checks running in background)")
 	return nil
 }
 
@@ -508,13 +575,11 @@ func (b *Bootstrap) detectActiveWAN(ctx context.Context) string {
 		log.Printf("  Configured WAN %s is not available, looking for alternatives...", b.config.WANInterface)
 	}
 
-	// Check multi-WAN interfaces if configured
-	if b.config.MultiWAN != nil && b.config.MultiWAN.Enabled {
-		for _, wan := range b.config.MultiWAN.WANs {
-			if wan.Enabled && b.isInterfaceUp(ctx, wan.Interface) {
-				log.Printf("  Multi-WAN interface %s is up", wan.Interface)
-				return wan.Interface
-			}
+	// Check configured WAN interfaces
+	for _, wan := range b.config.WANs {
+		if wan.Enabled && b.isInterfaceUp(ctx, wan.Interface) {
+			log.Printf("  WAN interface %s is up", wan.Interface)
+			return wan.Interface
 		}
 	}
 
@@ -720,25 +785,21 @@ func (b *Bootstrap) configureHAProxy(ctx context.Context) error {
 func (b *Bootstrap) startWANMonitoring(ctx context.Context) error {
 	log.Println("  Starting WAN health monitoring...")
 
-	// Build multi-WAN config, either from explicit config or auto-detected
-	var wanConfig *config.MultiWANConfig
-
-	if b.config.MultiWAN != nil && b.config.MultiWAN.Enabled {
-		// Use explicit multi-WAN configuration
-		wanConfig = b.config.MultiWAN
-		log.Printf("  Using configured multi-WAN with %d interfaces", len(wanConfig.WANs))
-	} else {
-		// Auto-detect WAN interfaces
-		wanConfig = b.autoDetectWANs(ctx)
-		if wanConfig == nil || len(wanConfig.WANs) == 0 {
+	// If no WANs configured, auto-detect and add to config
+	if len(b.config.WANs) == 0 {
+		detected := b.autoDetectWANs(ctx)
+		if len(detected) == 0 {
 			log.Println("  No WAN interfaces detected, skipping monitoring")
 			return nil
 		}
-		log.Printf("  Auto-detected %d WAN interfaces", len(wanConfig.WANs))
+		b.config.WANs = detected
+		log.Printf("  Auto-detected %d WAN interfaces", len(detected))
+	} else {
+		log.Printf("  Using configured %d WAN interfaces", len(b.config.WANs))
 	}
 
 	// Configure and start the multi-WAN manager
-	b.multiwan.Configure(wanConfig)
+	b.multiwan.Configure(b.config)
 	if err := b.multiwan.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start WAN monitoring: %w", err)
 	}
@@ -747,8 +808,8 @@ func (b *Bootstrap) startWANMonitoring(ctx context.Context) error {
 	return nil
 }
 
-// autoDetectWANs scans for available WAN interfaces and creates a multi-WAN config
-func (b *Bootstrap) autoDetectWANs(ctx context.Context) *config.MultiWANConfig {
+// autoDetectWANs scans for available WAN interfaces and returns detected WAN configs
+func (b *Bootstrap) autoDetectWANs(ctx context.Context) []config.WANConfig {
 	var wans []config.WANConfig
 	priority := 1
 
@@ -760,6 +821,12 @@ func (b *Bootstrap) autoDetectWANs(ctx context.Context) *config.MultiWANConfig {
 
 	// Track seen interfaces to avoid duplicates
 	seen := make(map[string]bool)
+
+	// Build set of WiFi AP interfaces to skip
+	wifiAPInterfaces := make(map[string]bool)
+	for _, wifi := range b.config.WiFiInterfaces {
+		wifiAPInterfaces[wifi.Interface] = true
+	}
 
 	// Parse default routes: default via X.X.X.X dev <interface>
 	lines := strings.Split(string(out), "\n")
@@ -786,6 +853,11 @@ func (b *Bootstrap) autoDetectWANs(ctx context.Context) *config.MultiWANConfig {
 			continue
 		}
 
+		// Skip WiFi AP interfaces
+		if wifiAPInterfaces[iface] {
+			continue
+		}
+
 		// Skip already seen
 		if seen[iface] {
 			continue
@@ -794,6 +866,7 @@ func (b *Bootstrap) autoDetectWANs(ctx context.Context) *config.MultiWANConfig {
 
 		// Add this interface as a WAN
 		wans = append(wans, config.WANConfig{
+			ID:                   config.GenerateWANID(),
 			Name:                 "Auto-" + iface,
 			Interface:            iface,
 			Enabled:              true,
@@ -810,6 +883,7 @@ func (b *Bootstrap) autoDetectWANs(ctx context.Context) *config.MultiWANConfig {
 	// Also add the configured WAN interface if not already detected
 	if b.config.WANInterface != "" && !seen[b.config.WANInterface] {
 		wans = append(wans, config.WANConfig{
+			ID:                   config.GenerateWANID(),
 			Name:                 "Configured-" + b.config.WANInterface,
 			Interface:            b.config.WANInterface,
 			Enabled:              true,
@@ -826,10 +900,5 @@ func (b *Bootstrap) autoDetectWANs(ctx context.Context) *config.MultiWANConfig {
 		return nil
 	}
 
-	return &config.MultiWANConfig{
-		Enabled:       true,
-		Mode:          "failover",
-		WANs:          wans,
-		FailbackDelay: 60, // Wait 60 seconds before switching back to higher priority WAN
-	}
+	return wans
 }
