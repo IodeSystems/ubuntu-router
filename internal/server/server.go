@@ -348,16 +348,19 @@ func (s *Server) startListeners(ctx context.Context, addrs []string, handler htt
 // startListener starts an HTTP server on a single address, waiting for the IP if needed
 func (s *Server) startListener(ctx context.Context, addr string, handler http.Handler, errCh chan<- error) {
 	// Check if the IP is available (for IP-bound addresses, not :port format)
+	// Skip check for wildcard addresses (0.0.0.0, ::) and :port format
 	if !strings.HasPrefix(addr, ":") {
 		ip := strings.Split(addr, ":")[0]
-		if !s.isIPAvailable(ip) {
-			log.Printf("IP %s not yet available, waiting...", ip)
-			// Wait for the IP to become available
-			s.waitForIP(ctx, ip)
-			if ctx.Err() != nil {
-				return
+		if ip != "0.0.0.0" && ip != "::" && ip != "" {
+			if !s.isIPAvailable(ip) {
+				log.Printf("IP %s not yet available, waiting...", ip)
+				// Wait for the IP to become available
+				s.waitForIP(ctx, ip)
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("IP %s is now available, starting listener", ip)
 			}
-			log.Printf("IP %s is now available, starting listener", ip)
 		}
 	}
 
