@@ -14,9 +14,13 @@ import (
 
 const (
 	sysClassNet = "/sys/class/net"
-	// Default sample interval for rate calculations
-	DefaultSampleInterval = time.Second
-	// Default history size (keeps last 60 samples = 1 minute at 1s interval)
+	// DefaultIdleSampleInterval is the sampling interval when no user is actively viewing
+	DefaultIdleSampleInterval = 60 * time.Second
+	// DefaultActiveSampleInterval is the sampling interval when a user is actively viewing
+	DefaultActiveSampleInterval = 2 * time.Second
+	// DefaultSampleInterval is kept for backward compatibility (use idle interval)
+	DefaultSampleInterval = DefaultIdleSampleInterval
+	// Default history size (keeps last 60 samples)
 	DefaultHistorySize = 60
 )
 
@@ -126,7 +130,11 @@ type Manager struct {
 	wifiClients *WiFiClientManager
 
 	// Sampling configuration
-	sampleInterval time.Duration
+	sampleInterval       time.Duration
+	idleSampleInterval   time.Duration
+	activeSampleInterval time.Duration
+	isActive             bool
+	intervalChangeChan   chan time.Duration
 
 	// Background sampling
 	stopChan chan struct{}
@@ -142,15 +150,73 @@ type Manager struct {
 // New creates a new stats Manager.
 func New(fs system.FileSystem, runner system.CommandRunner) *Manager {
 	return &Manager{
-		fs:             fs,
-		runner:         runner,
-		history:        make(map[string][]sample),
-		historySize:    DefaultHistorySize,
-		latencyHistory: make([]LatencyStats, 0, DefaultHistorySize),
-		latencyTarget:  "8.8.8.8", // Default ping target
-		wifiClients:    NewWiFiClientManager(runner),
-		sampleInterval: DefaultSampleInterval,
+		fs:                   fs,
+		runner:               runner,
+		history:              make(map[string][]sample),
+		historySize:          DefaultHistorySize,
+		latencyHistory:       make([]LatencyStats, 0, DefaultHistorySize),
+		latencyTarget:        "8.8.8.8", // Default ping target
+		wifiClients:          NewWiFiClientManager(runner),
+		sampleInterval:       DefaultIdleSampleInterval,
+		idleSampleInterval:   DefaultIdleSampleInterval,
+		activeSampleInterval: DefaultActiveSampleInterval,
+		isActive:             false,
+		intervalChangeChan:   make(chan time.Duration, 1),
 	}
+}
+
+// SetSampleIntervals configures the idle and active sampling intervals.
+func (m *Manager) SetSampleIntervals(idle, active time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.idleSampleInterval = idle
+	m.activeSampleInterval = active
+	// Update current interval based on active state
+	if m.isActive {
+		m.sampleInterval = active
+	} else {
+		m.sampleInterval = idle
+	}
+}
+
+// SetActive switches between active and idle sampling modes.
+// When active is true, sampling occurs more frequently for real-time UI updates.
+// When active is false, sampling occurs less frequently to save CPU.
+func (m *Manager) SetActive(active bool) {
+	m.mu.Lock()
+	wasActive := m.isActive
+	m.isActive = active
+	var newInterval time.Duration
+	if active {
+		newInterval = m.activeSampleInterval
+	} else {
+		newInterval = m.idleSampleInterval
+	}
+	m.sampleInterval = newInterval
+	m.mu.Unlock()
+
+	// Notify running sampler of interval change
+	if wasActive != active && m.running {
+		select {
+		case m.intervalChangeChan <- newInterval:
+		default:
+			// Channel full, sampler will pick up next tick
+		}
+	}
+}
+
+// IsActive returns whether the manager is in active sampling mode.
+func (m *Manager) IsActive() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.isActive
+}
+
+// GetSampleInterval returns the current sample interval.
+func (m *Manager) GetSampleInterval() time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.sampleInterval
 }
 
 // SetLatencyTarget sets the target for latency measurements.
@@ -490,6 +556,8 @@ func (m *Manager) GetSnapshot(ctx context.Context) (*StatsSnapshot, error) {
 }
 
 // StartSampling begins background sampling of statistics.
+// The interval parameter sets the initial sampling interval.
+// Use SetActive(true/false) to dynamically switch between active and idle intervals.
 func (m *Manager) StartSampling(ctx context.Context, interval time.Duration) {
 	m.mu.Lock()
 	if m.running {
@@ -498,6 +566,7 @@ func (m *Manager) StartSampling(ctx context.Context, interval time.Duration) {
 	}
 	m.running = true
 	m.stopChan = make(chan struct{})
+	m.sampleInterval = interval
 	store := m.store
 	m.mu.Unlock()
 
@@ -507,16 +576,15 @@ func (m *Manager) StartSampling(ctx context.Context, interval time.Duration) {
 		defer ticker.Stop()
 
 		// Take initial samples
-		_ = m.Sample(ctx)
-		_ = m.wifiClients.Sample(ctx)
-		m.recordWiFiClientSamples(ctx)
+		m.sampleAll(ctx)
 
 		for {
 			select {
 			case <-ticker.C:
-				_ = m.Sample(ctx)
-				_ = m.wifiClients.Sample(ctx)
-				m.recordWiFiClientSamples(ctx)
+				m.sampleAll(ctx)
+			case newInterval := <-m.intervalChangeChan:
+				// Dynamically change sampling interval
+				ticker.Reset(newInterval)
 			case <-m.stopChan:
 				return
 			case <-ctx.Done():
@@ -547,6 +615,18 @@ func (m *Manager) StartSampling(ctx context.Context, interval time.Duration) {
 			}
 		}()
 	}
+}
+
+// sampleAll takes all samples in a single pass, avoiding duplicate calls.
+func (m *Manager) sampleAll(ctx context.Context) {
+	// Sample interface stats
+	_ = m.Sample(ctx)
+
+	// Sample WiFi clients once
+	_ = m.wifiClients.Sample(ctx)
+
+	// Record WiFi client samples using cached data (avoid re-fetching)
+	m.recordWiFiClientSamplesFromCache(ctx)
 }
 
 // StopSampling stops background sampling.
@@ -607,6 +687,7 @@ func (m *Manager) QueryWiFiClientHistory(ctx context.Context, query WiFiClientHi
 }
 
 // recordWiFiClientSamples persists WiFi client samples to the store and triggers callbacks.
+// Note: This calls GetAllClientStats again. Prefer recordWiFiClientSamplesFromCache when possible.
 func (m *Manager) recordWiFiClientSamples(ctx context.Context) {
 	m.mu.RLock()
 	store := m.store
@@ -617,6 +698,30 @@ func (m *Manager) recordWiFiClientSamples(ctx context.Context) {
 	if err != nil {
 		return
 	}
+
+	// Persist to store
+	if store != nil {
+		for _, r := range rates {
+			_ = store.RecordWiFiClientSample(ctx, r)
+		}
+	}
+
+	// Call notification callback
+	if callback != nil {
+		callback(ctx, rates)
+	}
+}
+
+// recordWiFiClientSamplesFromCache persists WiFi client samples using already-cached data.
+// This avoids duplicate calls to GetAllClientStats that were made during Sample().
+func (m *Manager) recordWiFiClientSamplesFromCache(ctx context.Context) {
+	m.mu.RLock()
+	store := m.store
+	callback := m.onWiFiClientsSampled
+	m.mu.RUnlock()
+
+	// Use cached rates instead of re-fetching
+	rates := m.wifiClients.GetCachedRates()
 
 	// Persist to store
 	if store != nil {

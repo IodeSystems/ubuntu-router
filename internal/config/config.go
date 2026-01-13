@@ -82,6 +82,20 @@ type Config struct {
 
 	// Notifications (ntfy.sh)
 	Notifications *NotificationsConfig `json:"notifications,omitempty"`
+
+	// Stats sampling configuration
+	Stats *StatsConfig `json:"stats,omitempty"`
+}
+
+// StatsConfig represents statistics sampling configuration
+type StatsConfig struct {
+	// IdleSampleInterval is the sampling interval when no user is actively viewing (seconds)
+	// Default: 60 (1 minute)
+	IdleSampleInterval int `json:"idle_sample_interval,omitempty"`
+
+	// ActiveSampleInterval is the sampling interval when a user is actively viewing (seconds)
+	// Default: 2
+	ActiveSampleInterval int `json:"active_sample_interval,omitempty"`
 }
 
 // QoSConfig represents Quality of Service settings
@@ -395,6 +409,10 @@ func DefaultConfig() *Config {
 		Services: &ServicesConfig{
 			Enabled:  false,
 			Services: []Service{},
+		},
+		Stats: &StatsConfig{
+			IdleSampleInterval:   60, // 1 minute when idle
+			ActiveSampleInterval: 2,  // 2 seconds when active
 		},
 	}
 }
