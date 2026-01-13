@@ -223,11 +223,16 @@ func New(cfg *config.Config, configPath string, dryRun bool, version string) (*S
 
 // Run starts the HTTP server
 func (s *Server) Run() error {
+	// Compute effective listen addresses
+	listenAddrs := s.computeListenAddresses()
+
 	// Print admin password
 	fmt.Println()
 	fmt.Println("========================================")
 	fmt.Printf("Admin Password: %s\n", s.adminPassword)
-	fmt.Printf("Admin URL: http://localhost%s/admin\n", s.config.ListenAddr)
+	for _, addr := range listenAddrs {
+		fmt.Printf("Admin URL: http://%s/admin\n", addr)
+	}
 	fmt.Println("========================================")
 	fmt.Println()
 
@@ -235,17 +240,34 @@ func (s *Server) Run() error {
 
 	// Run startup bootstrap to apply essential config via health checks with auto-fix
 	// This ensures the router works after reboot without manual intervention
+	// Runs async with panic recovery to ensure web UI always starts
 	if !s.dryRun {
-		if err := s.bootstrap.Run(ctx); err != nil {
-			log.Printf("Warning: startup bootstrap failed: %v", err)
-		}
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Warning: startup bootstrap panic recovered: %v", r)
+				}
+			}()
+			if err := s.bootstrap.Run(ctx); err != nil {
+				log.Printf("Warning: startup bootstrap failed: %v", err)
+			}
+		}()
 	}
 
-	// Start multi-WAN failover monitoring if there are configured WANs
+	// Start multi-WAN failover monitoring in background if there are configured WANs
+	// This runs async to ensure the web UI is always available even if WAN config has issues
 	if len(s.config.WANs) > 0 {
-		if err := s.multiwan.Start(ctx); err != nil {
-			log.Printf("Warning: Failed to start multi-WAN: %v", err)
-		}
+		go func() {
+			// Recover from any panic in multi-WAN to prevent server crash
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Warning: Multi-WAN panic recovered: %v", r)
+				}
+			}()
+			if err := s.multiwan.Start(ctx); err != nil {
+				log.Printf("Warning: Failed to start multi-WAN: %v", err)
+			}
+		}()
 	}
 
 	// Set up WiFi client callback for notifications
@@ -264,30 +286,125 @@ func (s *Server) Run() error {
 
 	// Set up routes
 	mux := s.setupRoutes()
+	handler := s.loggingMiddleware(mux)
 
-	// Determine listen address
-	// If ListenAddr is just a port (e.g., ":8080"), bind to LAN IP for security
-	// This prevents the admin UI from being accessible from the WAN interface
-	listenAddr := s.config.ListenAddr
-	if strings.HasPrefix(listenAddr, ":") && len(s.config.LANAddresses) > 0 {
-		// Extract IP from CIDR (e.g., "192.168.2.1/24" -> "192.168.2.1")
-		lanIP := strings.Split(s.config.LANAddresses[0], "/")[0]
-		port := listenAddr // ":8080"
-		listenAddr = lanIP + port
-		log.Printf("Binding to LAN interface %s for security", listenAddr)
+	// Start listeners on all configured addresses
+	return s.startListeners(ctx, listenAddrs, handler)
+}
+
+// computeListenAddresses returns the list of addresses the server should listen on.
+// Priority:
+// 1. WebListenAddresses from config (if set)
+// 2. ListenAddr from config (legacy, single address)
+// 3. Default: all LAN addresses on port 8080
+func (s *Server) computeListenAddresses() []string {
+	configAddrs := s.config.GetWebListenAddresses()
+	if len(configAddrs) > 0 {
+		return configAddrs
 	}
 
-	// Create HTTP server
+	// Default: bind to each LAN IP address on port 8080
+	port := s.config.GetWebListenPort()
+	if port == "" {
+		port = ":8080"
+	}
+
+	var addrs []string
+	for _, lanCIDR := range s.config.LANAddresses {
+		// Extract IP from CIDR (e.g., "192.168.2.1/24" -> "192.168.2.1")
+		lanIP := strings.Split(lanCIDR, "/")[0]
+		addrs = append(addrs, lanIP+port)
+	}
+
+	// If no LAN addresses configured, fall back to all interfaces
+	if len(addrs) == 0 {
+		addrs = []string{port}
+	}
+
+	return addrs
+}
+
+// startListeners starts HTTP servers on all specified addresses
+func (s *Server) startListeners(ctx context.Context, addrs []string, handler http.Handler) error {
+	if len(addrs) == 0 {
+		return fmt.Errorf("no listen addresses configured")
+	}
+
+	// Start each listener in a goroutine - they will wait for their IP if needed
+	errCh := make(chan error, len(addrs))
+	for _, addr := range addrs {
+		go s.startListener(ctx, addr, handler, errCh)
+	}
+
+	// Wait for first error or context cancellation
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// startListener starts an HTTP server on a single address, waiting for the IP if needed
+func (s *Server) startListener(ctx context.Context, addr string, handler http.Handler, errCh chan<- error) {
+	// Check if the IP is available (for IP-bound addresses, not :port format)
+	// Skip check for wildcard addresses (0.0.0.0, ::) and :port format
+	if !strings.HasPrefix(addr, ":") {
+		ip := strings.Split(addr, ":")[0]
+		if ip != "0.0.0.0" && ip != "::" && ip != "" {
+			if !s.isIPAvailable(ip) {
+				log.Printf("IP %s not yet available, waiting...", ip)
+				// Wait for the IP to become available
+				s.waitForIP(ctx, ip)
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("IP %s is now available, starting listener", ip)
+			}
+		}
+	}
+
 	server := &http.Server{
-		Addr:         listenAddr,
-		Handler:      s.loggingMiddleware(mux),
+		Addr:         addr,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
+	log.Printf("Starting server on %s", addr)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		errCh <- fmt.Errorf("listener %s: %w", addr, err)
+	}
+}
 
-	log.Printf("Starting server on %s", listenAddr)
-	return server.ListenAndServe()
+// waitForIP blocks until the given IP is available on the system
+func (s *Server) waitForIP(ctx context.Context, ip string) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.isIPAvailable(ip) {
+				log.Printf("IP %s is now available", ip)
+				return
+			}
+		}
+	}
+}
+
+// isIPAvailable checks if an IP address is configured on any interface
+func (s *Server) isIPAvailable(ip string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	out, err := s.runner.Run(ctx, "ip", "-4", "addr", "show")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "inet "+ip)
 }
 
 func (s *Server) setupRoutes() *http.ServeMux {

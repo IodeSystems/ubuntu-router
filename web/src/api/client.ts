@@ -187,6 +187,7 @@ export interface RouterStatus {
 
 export interface RouterConfig {
   listenAddr: string;
+  webListenAddresses?: string[];
   wanInterface: string;
   wanMode: string;
   wanStaticIp?: string;

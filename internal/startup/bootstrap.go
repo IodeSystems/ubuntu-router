@@ -11,7 +11,6 @@ import (
 	"github.com/iodesystems/ubuntu-router/internal/dnsmasq"
 	"github.com/iodesystems/ubuntu-router/internal/haproxy"
 	"github.com/iodesystems/ubuntu-router/internal/health"
-	"github.com/iodesystems/ubuntu-router/internal/multiwan"
 	"github.com/iodesystems/ubuntu-router/internal/system"
 	"github.com/iodesystems/ubuntu-router/internal/wifi"
 	"github.com/iodesystems/ubuntu-router/internal/wireguard"
@@ -29,7 +28,6 @@ type Bootstrap struct {
 	dns          *dnsmasq.Manager
 	wifi         *wifi.Manager
 	haproxy      *haproxy.Manager
-	multiwan     *multiwan.Manager
 	healthRunner *health.Runner
 }
 
@@ -96,7 +94,6 @@ func New(runner system.CommandRunner, fs system.FileSystem, cfg *config.Config, 
 		dns:          dnsmasq.New(fs, runner, cfg.DNSConfigPath, cfg.DHCPConfigPath, cfg.DNSHostsPath),
 		wifi:         wifi.New(fs, runner),
 		haproxy:      haproxy.New(fs, runner, "/etc/ubuntu-router/certs"),
-		multiwan:     multiwan.New(runner, fs),
 		healthRunner: healthRunner,
 	}
 }
@@ -140,9 +137,27 @@ func (b *Bootstrap) Run(ctx context.Context) error {
 
 	// Start async background tasks that aren't covered by health checks
 	// These run independently and don't block startup
+	// All goroutines have panic recovery to ensure service stability
+
+	// LAN bridge configuration (needed before WiFi AP can work properly)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("LAN bridge panic recovered: %v", r)
+			}
+		}()
+		if err := b.configureLANBridge(ctx); err != nil {
+			log.Printf("LAN bridge warning: %v", err)
+		}
+	}()
 
 	// WiFi WAN connection (can take 30+ seconds for WPA3)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("WiFi WAN panic recovered: %v", r)
+			}
+		}()
 		if err := b.configureWiFiWAN(ctx); err != nil {
 			log.Printf("WiFi WAN warning: %v", err)
 		}
@@ -150,6 +165,11 @@ func (b *Bootstrap) Run(ctx context.Context) error {
 
 	// WireGuard interfaces (may block on DNS resolution)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("WireGuard interfaces panic recovered: %v", r)
+			}
+		}()
 		if err := b.startWireGuardInterfaces(ctx); err != nil {
 			log.Printf("WireGuard interfaces warning: %v", err)
 		}
@@ -157,6 +177,11 @@ func (b *Bootstrap) Run(ctx context.Context) error {
 
 	// WiFi access points
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("WiFi AP panic recovered: %v", r)
+			}
+		}()
 		if err := b.configureWiFi(ctx); err != nil {
 			log.Printf("WiFi AP warning: %v", err)
 		}
@@ -164,17 +189,18 @@ func (b *Bootstrap) Run(ctx context.Context) error {
 
 	// HAProxy for services
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("HAProxy panic recovered: %v", r)
+			}
+		}()
 		if err := b.configureHAProxy(ctx); err != nil {
 			log.Printf("HAProxy warning: %v", err)
 		}
 	}()
 
-	// WAN health monitoring (runs continuously)
-	go func() {
-		if err := b.startWANMonitoring(ctx); err != nil {
-			log.Printf("WAN monitoring warning: %v", err)
-		}
-	}()
+	// Note: WAN health monitoring is handled by server.Run() using the shared multiwan.Manager
+	// This avoids duplicate multi-WAN instances racing with each other
 
 	log.Println("Startup bootstrap initiated (health checks running in background)")
 	return nil
@@ -778,127 +804,4 @@ func (b *Bootstrap) configureHAProxy(ctx context.Context) error {
 
 	log.Println("  HAProxy configured and restarted")
 	return nil
-}
-
-// startWANMonitoring starts the multi-WAN health monitoring with auto-failover.
-// If multi-WAN isn't explicitly configured, it auto-detects available WAN interfaces.
-func (b *Bootstrap) startWANMonitoring(ctx context.Context) error {
-	log.Println("  Starting WAN health monitoring...")
-
-	// If no WANs configured, auto-detect and add to config
-	if len(b.config.WANs) == 0 {
-		detected := b.autoDetectWANs(ctx)
-		if len(detected) == 0 {
-			log.Println("  No WAN interfaces detected, skipping monitoring")
-			return nil
-		}
-		b.config.WANs = detected
-		log.Printf("  Auto-detected %d WAN interfaces", len(detected))
-	} else {
-		log.Printf("  Using configured %d WAN interfaces", len(b.config.WANs))
-	}
-
-	// Configure and start the multi-WAN manager
-	b.multiwan.Configure(b.config)
-	if err := b.multiwan.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start WAN monitoring: %w", err)
-	}
-
-	log.Println("  WAN health monitoring started")
-	return nil
-}
-
-// autoDetectWANs scans for available WAN interfaces and returns detected WAN configs
-func (b *Bootstrap) autoDetectWANs(ctx context.Context) []config.WANConfig {
-	var wans []config.WANConfig
-	priority := 1
-
-	// Get all interfaces with default routes
-	out, err := b.runner.Run(ctx, "ip", "-4", "route", "show", "default")
-	if err != nil {
-		return nil
-	}
-
-	// Track seen interfaces to avoid duplicates
-	seen := make(map[string]bool)
-
-	// Build set of WiFi AP interfaces to skip
-	wifiAPInterfaces := make(map[string]bool)
-	for _, wifi := range b.config.WiFiInterfaces {
-		wifiAPInterfaces[wifi.Interface] = true
-	}
-
-	// Parse default routes: default via X.X.X.X dev <interface>
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		if !strings.HasPrefix(line, "default via") {
-			continue
-		}
-
-		parts := strings.Fields(line)
-		var iface string
-		for i, part := range parts {
-			if part == "dev" && i+1 < len(parts) {
-				iface = parts[i+1]
-				break
-			}
-		}
-
-		if iface == "" {
-			continue
-		}
-
-		// Skip bridge, loopback, and wireguard interfaces
-		if iface == b.config.LANBridge || iface == "lo" || strings.HasPrefix(iface, "wg") {
-			continue
-		}
-
-		// Skip WiFi AP interfaces
-		if wifiAPInterfaces[iface] {
-			continue
-		}
-
-		// Skip already seen
-		if seen[iface] {
-			continue
-		}
-		seen[iface] = true
-
-		// Add this interface as a WAN
-		wans = append(wans, config.WANConfig{
-			ID:                   config.GenerateWANID(),
-			Name:                 "Auto-" + iface,
-			Interface:            iface,
-			Enabled:              true,
-			Priority:             priority,
-			HealthCheckInterval:  10,
-			HealthCheckTimeout:   5,
-			HealthCheckRetries:   3,
-			HealthCheckTargets:   []string{"8.8.8.8", "1.1.1.1"},
-		})
-		priority++
-		log.Printf("  Auto-detected WAN: %s (priority %d)", iface, priority-1)
-	}
-
-	// Also add the configured WAN interface if not already detected
-	if b.config.WANInterface != "" && !seen[b.config.WANInterface] {
-		wans = append(wans, config.WANConfig{
-			ID:                   config.GenerateWANID(),
-			Name:                 "Configured-" + b.config.WANInterface,
-			Interface:            b.config.WANInterface,
-			Enabled:              true,
-			Priority:             priority,
-			HealthCheckInterval:  10,
-			HealthCheckTimeout:   5,
-			HealthCheckRetries:   3,
-			HealthCheckTargets:   []string{"8.8.8.8", "1.1.1.1"},
-		})
-		log.Printf("  Added configured WAN: %s (priority %d)", b.config.WANInterface, priority)
-	}
-
-	if len(wans) == 0 {
-		return nil
-	}
-
-	return wans
 }

@@ -13,7 +13,8 @@ import (
 // Config represents the router configuration
 type Config struct {
 	// Server settings
-	ListenAddr string `json:"listen_addr"`
+	ListenAddr         string   `json:"listen_addr"`                    // Deprecated: use WebListenAddresses
+	WebListenAddresses []string `json:"web_listen_addresses,omitempty"` // List of addresses to listen on (e.g., ["192.168.1.1:8080", "10.0.0.1:8080"])
 
 	// WAN interfaces (internet uplinks) - ordered by priority
 	WANs          []WANConfig `json:"wans"`
@@ -591,6 +592,34 @@ func (cfg *Config) GetEnabledWANs() []WANConfig {
 		}
 	}
 	return enabled
+}
+
+// GetWebListenAddresses returns the effective list of web listen addresses.
+// If WebListenAddresses is set, returns that list.
+// Otherwise, if ListenAddr is set, returns a single-element list with that.
+// If neither is set, returns nil (server should compute default from LAN addresses).
+func (cfg *Config) GetWebListenAddresses() []string {
+	if len(cfg.WebListenAddresses) > 0 {
+		return cfg.WebListenAddresses
+	}
+	if cfg.ListenAddr != "" {
+		return []string{cfg.ListenAddr}
+	}
+	return nil
+}
+
+// GetWebListenPort extracts the port from the first configured listen address,
+// or returns ":8080" as default.
+func (cfg *Config) GetWebListenPort() string {
+	addrs := cfg.GetWebListenAddresses()
+	if len(addrs) > 0 {
+		// Extract port from first address
+		addr := addrs[0]
+		if idx := strings.LastIndex(addr, ":"); idx != -1 {
+			return addr[idx:]
+		}
+	}
+	return ":8080"
 }
 
 // Save writes config to a JSON file
