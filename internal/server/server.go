@@ -330,60 +330,10 @@ func (s *Server) startListeners(ctx context.Context, addrs []string, handler htt
 		return fmt.Errorf("no listen addresses configured")
 	}
 
-	// If only one address, use simple blocking ListenAndServe
-	if len(addrs) == 1 {
-		addr := addrs[0]
-		// Check if the IP is available (for LAN-bound addresses)
-		if !strings.HasPrefix(addr, ":") {
-			ip := strings.Split(addr, ":")[0]
-			if !s.isIPAvailable(ip) {
-				log.Printf("IP %s not yet available, binding to all interfaces %s", ip, s.config.GetWebListenPort())
-				// Fall back to all interfaces, but try to rebind later
-				go s.waitAndRebindToAddress(ctx, addr, handler)
-				addr = s.config.GetWebListenPort()
-			}
-		}
-
-		server := &http.Server{
-			Addr:         addr,
-			Handler:      handler,
-			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 30 * time.Second,
-			IdleTimeout:  60 * time.Second,
-		}
-		log.Printf("Starting server on %s", addr)
-		return server.ListenAndServe()
-	}
-
-	// Multiple addresses: start each in a goroutine
+	// Start each listener in a goroutine - they will wait for their IP if needed
 	errCh := make(chan error, len(addrs))
 	for _, addr := range addrs {
-		go func(addr string) {
-			// Check if the IP is available
-			if !strings.HasPrefix(addr, ":") {
-				ip := strings.Split(addr, ":")[0]
-				if !s.isIPAvailable(ip) {
-					log.Printf("IP %s not yet available, will retry", ip)
-					// Wait for the IP to become available
-					s.waitForIP(ctx, ip)
-					if ctx.Err() != nil {
-						return
-					}
-				}
-			}
-
-			server := &http.Server{
-				Addr:         addr,
-				Handler:      handler,
-				ReadTimeout:  30 * time.Second,
-				WriteTimeout: 30 * time.Second,
-				IdleTimeout:  60 * time.Second,
-			}
-			log.Printf("Starting server on %s", addr)
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				errCh <- fmt.Errorf("listener %s: %w", addr, err)
-			}
-		}(addr)
+		go s.startListener(ctx, addr, handler, errCh)
 	}
 
 	// Wait for first error or context cancellation
@@ -392,6 +342,35 @@ func (s *Server) startListeners(ctx context.Context, addrs []string, handler htt
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// startListener starts an HTTP server on a single address, waiting for the IP if needed
+func (s *Server) startListener(ctx context.Context, addr string, handler http.Handler, errCh chan<- error) {
+	// Check if the IP is available (for IP-bound addresses, not :port format)
+	if !strings.HasPrefix(addr, ":") {
+		ip := strings.Split(addr, ":")[0]
+		if !s.isIPAvailable(ip) {
+			log.Printf("IP %s not yet available, waiting...", ip)
+			// Wait for the IP to become available
+			s.waitForIP(ctx, ip)
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("IP %s is now available, starting listener", ip)
+		}
+	}
+
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	log.Printf("Starting server on %s", addr)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		errCh <- fmt.Errorf("listener %s: %w", addr, err)
 	}
 }
 
@@ -407,31 +386,6 @@ func (s *Server) waitForIP(ctx context.Context, ip string) {
 		case <-ticker.C:
 			if s.isIPAvailable(ip) {
 				log.Printf("IP %s is now available", ip)
-				return
-			}
-		}
-	}
-}
-
-// waitAndRebindToAddress logs when an IP becomes available (for single-listener fallback mode)
-func (s *Server) waitAndRebindToAddress(ctx context.Context, targetAddr string, handler http.Handler) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("waitAndRebindToAddress panic recovered: %v", r)
-		}
-	}()
-
-	ip := strings.Split(targetAddr, ":")[0]
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if s.isIPAvailable(ip) {
-				log.Printf("IP %s is now available. Restart service to bind to configured addresses.", ip)
 				return
 			}
 		}
