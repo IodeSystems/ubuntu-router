@@ -80,6 +80,14 @@ func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 		if addr, ok := updates["listenAddr"].(string); ok {
 			s.config.ListenAddr = addr
 		}
+		if addrs, ok := updates["webListenAddresses"].([]interface{}); ok {
+			s.config.WebListenAddresses = make([]string, 0, len(addrs))
+			for _, a := range addrs {
+				if str, ok := a.(string); ok {
+					s.config.WebListenAddresses = append(s.config.WebListenAddresses, str)
+				}
+			}
+		}
 
 		if err := s.saveConfig(); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())

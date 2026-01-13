@@ -223,11 +223,16 @@ func New(cfg *config.Config, configPath string, dryRun bool, version string) (*S
 
 // Run starts the HTTP server
 func (s *Server) Run() error {
+	// Compute effective listen addresses
+	listenAddrs := s.computeListenAddresses()
+
 	// Print admin password
 	fmt.Println()
 	fmt.Println("========================================")
 	fmt.Printf("Admin Password: %s\n", s.adminPassword)
-	fmt.Printf("Admin URL: http://localhost%s/admin\n", s.config.ListenAddr)
+	for _, addr := range listenAddrs {
+		fmt.Printf("Admin URL: http://%s/admin\n", addr)
+	}
 	fmt.Println("========================================")
 	fmt.Println()
 
@@ -281,41 +286,156 @@ func (s *Server) Run() error {
 
 	// Set up routes
 	mux := s.setupRoutes()
+	handler := s.loggingMiddleware(mux)
 
-	// Determine listen address
-	// If ListenAddr is just a port (e.g., ":8080"), try to bind to LAN IP for security
-	// This prevents the admin UI from being accessible from the WAN interface
-	// However, if the LAN interface isn't ready yet, fall back to all interfaces
-	listenAddr := s.config.ListenAddr
-	if strings.HasPrefix(listenAddr, ":") && len(s.config.LANAddresses) > 0 {
+	// Start listeners on all configured addresses
+	return s.startListeners(ctx, listenAddrs, handler)
+}
+
+// computeListenAddresses returns the list of addresses the server should listen on.
+// Priority:
+// 1. WebListenAddresses from config (if set)
+// 2. ListenAddr from config (legacy, single address)
+// 3. Default: all LAN addresses on port 8080
+func (s *Server) computeListenAddresses() []string {
+	configAddrs := s.config.GetWebListenAddresses()
+	if len(configAddrs) > 0 {
+		return configAddrs
+	}
+
+	// Default: bind to each LAN IP address on port 8080
+	port := s.config.GetWebListenPort()
+	if port == "" {
+		port = ":8080"
+	}
+
+	var addrs []string
+	for _, lanCIDR := range s.config.LANAddresses {
 		// Extract IP from CIDR (e.g., "192.168.2.1/24" -> "192.168.2.1")
-		lanIP := strings.Split(s.config.LANAddresses[0], "/")[0]
-		port := listenAddr // ":8080"
-		lanAddr := lanIP + port
+		lanIP := strings.Split(lanCIDR, "/")[0]
+		addrs = append(addrs, lanIP+port)
+	}
 
-		// Check if the LAN IP is available on this system
-		// The bootstrap configures this async, so it may not be ready yet
-		if s.isIPAvailable(lanIP) {
-			listenAddr = lanAddr
-			log.Printf("Binding to LAN interface %s for security", listenAddr)
-		} else {
-			log.Printf("LAN IP %s not yet available, binding to all interfaces %s (will rebind when LAN is ready)", lanIP, listenAddr)
-			// Start a goroutine to rebind to LAN IP once it's available
-			go s.waitAndRebindToLAN(ctx, lanAddr, mux)
+	// If no LAN addresses configured, fall back to all interfaces
+	if len(addrs) == 0 {
+		addrs = []string{port}
+	}
+
+	return addrs
+}
+
+// startListeners starts HTTP servers on all specified addresses
+func (s *Server) startListeners(ctx context.Context, addrs []string, handler http.Handler) error {
+	if len(addrs) == 0 {
+		return fmt.Errorf("no listen addresses configured")
+	}
+
+	// If only one address, use simple blocking ListenAndServe
+	if len(addrs) == 1 {
+		addr := addrs[0]
+		// Check if the IP is available (for LAN-bound addresses)
+		if !strings.HasPrefix(addr, ":") {
+			ip := strings.Split(addr, ":")[0]
+			if !s.isIPAvailable(ip) {
+				log.Printf("IP %s not yet available, binding to all interfaces %s", ip, s.config.GetWebListenPort())
+				// Fall back to all interfaces, but try to rebind later
+				go s.waitAndRebindToAddress(ctx, addr, handler)
+				addr = s.config.GetWebListenPort()
+			}
+		}
+
+		server := &http.Server{
+			Addr:         addr,
+			Handler:      handler,
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 30 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+		log.Printf("Starting server on %s", addr)
+		return server.ListenAndServe()
+	}
+
+	// Multiple addresses: start each in a goroutine
+	errCh := make(chan error, len(addrs))
+	for _, addr := range addrs {
+		go func(addr string) {
+			// Check if the IP is available
+			if !strings.HasPrefix(addr, ":") {
+				ip := strings.Split(addr, ":")[0]
+				if !s.isIPAvailable(ip) {
+					log.Printf("IP %s not yet available, will retry", ip)
+					// Wait for the IP to become available
+					s.waitForIP(ctx, ip)
+					if ctx.Err() != nil {
+						return
+					}
+				}
+			}
+
+			server := &http.Server{
+				Addr:         addr,
+				Handler:      handler,
+				ReadTimeout:  30 * time.Second,
+				WriteTimeout: 30 * time.Second,
+				IdleTimeout:  60 * time.Second,
+			}
+			log.Printf("Starting server on %s", addr)
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("listener %s: %w", addr, err)
+			}
+		}(addr)
+	}
+
+	// Wait for first error or context cancellation
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// waitForIP blocks until the given IP is available on the system
+func (s *Server) waitForIP(ctx context.Context, ip string) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.isIPAvailable(ip) {
+				log.Printf("IP %s is now available", ip)
+				return
+			}
 		}
 	}
+}
 
-	// Create HTTP server
-	server := &http.Server{
-		Addr:         listenAddr,
-		Handler:      s.loggingMiddleware(mux),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+// waitAndRebindToAddress logs when an IP becomes available (for single-listener fallback mode)
+func (s *Server) waitAndRebindToAddress(ctx context.Context, targetAddr string, handler http.Handler) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("waitAndRebindToAddress panic recovered: %v", r)
+		}
+	}()
+
+	ip := strings.Split(targetAddr, ":")[0]
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.isIPAvailable(ip) {
+				log.Printf("IP %s is now available. Restart service to bind to configured addresses.", ip)
+				return
+			}
+		}
 	}
-
-	log.Printf("Starting server on %s", listenAddr)
-	return server.ListenAndServe()
 }
 
 // isIPAvailable checks if an IP address is configured on any interface
@@ -328,33 +448,6 @@ func (s *Server) isIPAvailable(ip string) bool {
 		return false
 	}
 	return strings.Contains(string(out), "inet "+ip)
-}
-
-// waitAndRebindToLAN waits for the LAN IP to become available and logs when it does
-// Note: We don't actually rebind the server - we just log that the LAN is now available
-// The admin can restart the service if they want strict LAN-only binding
-func (s *Server) waitAndRebindToLAN(ctx context.Context, lanAddr string, mux *http.ServeMux) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("waitAndRebindToLAN panic recovered: %v", r)
-		}
-	}()
-
-	lanIP := strings.Split(lanAddr, ":")[0]
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if s.isIPAvailable(lanIP) {
-				log.Printf("LAN IP %s is now available. Restart service to bind exclusively to LAN.", lanIP)
-				return
-			}
-		}
-	}
 }
 
 func (s *Server) setupRoutes() *http.ServeMux {

@@ -46,7 +46,10 @@ function SettingsPage() {
   const { mutate: updateNotifications, isLoading: isUpdatingNotifications } = useMutation('updateNotificationSettings');
   const [isTesting, setIsTesting] = useState(false);
 
-  const [listenAddr, setListenAddr] = useState(configData?.listenAddr || ':8080');
+  const [webListenAddresses, setWebListenAddresses] = useState<string[]>(
+    configData?.webListenAddresses || (configData?.listenAddr ? [configData.listenAddr] : [])
+  );
+  const [newListenAddr, setNewListenAddr] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
@@ -71,6 +74,15 @@ function SettingsPage() {
   const [rebootDialogOpen, setRebootDialogOpen] = useState(false);
   const [isShuttingDown, setIsShuttingDown] = useState(false);
   const [isRebooting, setIsRebooting] = useState(false);
+
+  // Sync config settings from server
+  useEffect(() => {
+    if (configData) {
+      setWebListenAddresses(
+        configData.webListenAddresses || (configData.listenAddr ? [configData.listenAddr] : [])
+      );
+    }
+  }, [configData]);
 
   // Sync notification settings from server
   useEffect(() => {
@@ -98,12 +110,33 @@ function SettingsPage() {
 
   const handleSave = async () => {
     try {
-      await updateConfig({ listenAddr });
-      setSuccess('Settings saved');
+      await updateConfig({ webListenAddresses });
+      setSuccess('Settings saved. Restart required for changes to take effect.');
       setError(null);
     } catch (e) {
       setError(String(e));
     }
+  };
+
+  const handleAddListenAddr = () => {
+    const addr = newListenAddr.trim();
+    if (!addr) return;
+    // Validate format: should be IP:port or :port
+    if (!/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})?:\d+$/.test(addr)) {
+      setError('Invalid address format. Use IP:port (e.g., 192.168.1.1:8080) or :port (e.g., :8080)');
+      return;
+    }
+    if (webListenAddresses.includes(addr)) {
+      setError('Address already in list');
+      return;
+    }
+    setWebListenAddresses([...webListenAddresses, addr]);
+    setNewListenAddr('');
+    setError(null);
+  };
+
+  const handleRemoveListenAddr = (addr: string) => {
+    setWebListenAddresses(webListenAddresses.filter(a => a !== addr));
   };
 
   const handleSaveNotifications = async () => {
@@ -212,17 +245,47 @@ function SettingsPage() {
           <Card>
             <CardContent>
               <Typography variant="h6" color="primary" gutterBottom>
-                General Settings
+                Web Interface Listen Addresses
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Configure which addresses the web UI listens on. If empty, defaults to LAN addresses on port 8080.
               </Typography>
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <TextField
-                  label="Listen Address"
-                  size="small"
-                  value={listenAddr}
-                  onChange={(e) => setListenAddr(e.target.value)}
-                  placeholder=":8080"
-                  helperText="Address and port for the web interface"
-                />
+                {webListenAddresses.length > 0 ? (
+                  <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                    {webListenAddresses.map((addr) => (
+                      <Chip
+                        key={addr}
+                        label={addr}
+                        onDelete={() => handleRemoveListenAddr(addr)}
+                        sx={{ fontFamily: 'monospace' }}
+                      />
+                    ))}
+                  </Box>
+                ) : (
+                  <Typography variant="body2" color="text.secondary" sx={{ fontStyle: 'italic' }}>
+                    No addresses configured (using default: LAN IPs on port 8080)
+                  </Typography>
+                )}
+                <Box sx={{ display: 'flex', gap: 1 }}>
+                  <TextField
+                    label="Add Address"
+                    size="small"
+                    value={newListenAddr}
+                    onChange={(e) => setNewListenAddr(e.target.value)}
+                    placeholder="192.168.1.1:8080 or :8080"
+                    helperText="IP:port or :port for all interfaces"
+                    onKeyDown={(e) => e.key === 'Enter' && handleAddListenAddr()}
+                    sx={{ flexGrow: 1 }}
+                  />
+                  <Button
+                    variant="outlined"
+                    onClick={handleAddListenAddr}
+                    disabled={!newListenAddr.trim()}
+                  >
+                    Add
+                  </Button>
+                </Box>
                 <Button
                   variant="contained"
                   onClick={handleSave}

@@ -55,12 +55,12 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Override listen address if specified
+	// Override listen address if specified via CLI flag
+	// This takes precedence over config file settings
 	if *listenAddr != ":8080" {
+		// CLI flag specified - use it as the sole listen address
+		cfg.WebListenAddresses = []string{*listenAddr}
 		cfg.ListenAddr = *listenAddr
-	}
-	if cfg.ListenAddr == "" {
-		cfg.ListenAddr = ":8080"
 	}
 
 	if *check {
