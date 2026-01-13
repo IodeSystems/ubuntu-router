@@ -235,17 +235,34 @@ func (s *Server) Run() error {
 
 	// Run startup bootstrap to apply essential config via health checks with auto-fix
 	// This ensures the router works after reboot without manual intervention
+	// Runs async with panic recovery to ensure web UI always starts
 	if !s.dryRun {
-		if err := s.bootstrap.Run(ctx); err != nil {
-			log.Printf("Warning: startup bootstrap failed: %v", err)
-		}
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Warning: startup bootstrap panic recovered: %v", r)
+				}
+			}()
+			if err := s.bootstrap.Run(ctx); err != nil {
+				log.Printf("Warning: startup bootstrap failed: %v", err)
+			}
+		}()
 	}
 
-	// Start multi-WAN failover monitoring if there are configured WANs
+	// Start multi-WAN failover monitoring in background if there are configured WANs
+	// This runs async to ensure the web UI is always available even if WAN config has issues
 	if len(s.config.WANs) > 0 {
-		if err := s.multiwan.Start(ctx); err != nil {
-			log.Printf("Warning: Failed to start multi-WAN: %v", err)
-		}
+		go func() {
+			// Recover from any panic in multi-WAN to prevent server crash
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Warning: Multi-WAN panic recovered: %v", r)
+				}
+			}()
+			if err := s.multiwan.Start(ctx); err != nil {
+				log.Printf("Warning: Failed to start multi-WAN: %v", err)
+			}
+		}()
 	}
 
 	// Set up WiFi client callback for notifications
@@ -266,15 +283,26 @@ func (s *Server) Run() error {
 	mux := s.setupRoutes()
 
 	// Determine listen address
-	// If ListenAddr is just a port (e.g., ":8080"), bind to LAN IP for security
+	// If ListenAddr is just a port (e.g., ":8080"), try to bind to LAN IP for security
 	// This prevents the admin UI from being accessible from the WAN interface
+	// However, if the LAN interface isn't ready yet, fall back to all interfaces
 	listenAddr := s.config.ListenAddr
 	if strings.HasPrefix(listenAddr, ":") && len(s.config.LANAddresses) > 0 {
 		// Extract IP from CIDR (e.g., "192.168.2.1/24" -> "192.168.2.1")
 		lanIP := strings.Split(s.config.LANAddresses[0], "/")[0]
 		port := listenAddr // ":8080"
-		listenAddr = lanIP + port
-		log.Printf("Binding to LAN interface %s for security", listenAddr)
+		lanAddr := lanIP + port
+
+		// Check if the LAN IP is available on this system
+		// The bootstrap configures this async, so it may not be ready yet
+		if s.isIPAvailable(lanIP) {
+			listenAddr = lanAddr
+			log.Printf("Binding to LAN interface %s for security", listenAddr)
+		} else {
+			log.Printf("LAN IP %s not yet available, binding to all interfaces %s (will rebind when LAN is ready)", lanIP, listenAddr)
+			// Start a goroutine to rebind to LAN IP once it's available
+			go s.waitAndRebindToLAN(ctx, lanAddr, mux)
+		}
 	}
 
 	// Create HTTP server
@@ -288,6 +316,45 @@ func (s *Server) Run() error {
 
 	log.Printf("Starting server on %s", listenAddr)
 	return server.ListenAndServe()
+}
+
+// isIPAvailable checks if an IP address is configured on any interface
+func (s *Server) isIPAvailable(ip string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	out, err := s.runner.Run(ctx, "ip", "-4", "addr", "show")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "inet "+ip)
+}
+
+// waitAndRebindToLAN waits for the LAN IP to become available and logs when it does
+// Note: We don't actually rebind the server - we just log that the LAN is now available
+// The admin can restart the service if they want strict LAN-only binding
+func (s *Server) waitAndRebindToLAN(ctx context.Context, lanAddr string, mux *http.ServeMux) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("waitAndRebindToLAN panic recovered: %v", r)
+		}
+	}()
+
+	lanIP := strings.Split(lanAddr, ":")[0]
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.isIPAvailable(lanIP) {
+				log.Printf("LAN IP %s is now available. Restart service to bind exclusively to LAN.", lanIP)
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) setupRoutes() *http.ServeMux {

@@ -98,6 +98,12 @@ func (m *Manager) Configure(cfg *config.Config) {
 	}
 }
 
+// interfaceExists checks if a network interface exists on the system
+func (m *Manager) interfaceExists(ctx context.Context, iface string) bool {
+	_, err := m.runner.Run(ctx, "ip", "link", "show", iface)
+	return err == nil
+}
+
 // Start begins the failover monitoring loop
 func (m *Manager) Start(ctx context.Context) error {
 	m.mu.Lock()
@@ -114,12 +120,40 @@ func (m *Manager) Start(ctx context.Context) error {
 	wans := m.wans
 	m.mu.Unlock()
 
-	logger.Info("Multi-WAN failover starting with %d WANs", len(wans))
+	// Filter out WANs with missing interfaces to avoid errors
+	var activeWANs []config.WANConfig
+	for _, wan := range wans {
+		if !wan.Enabled {
+			continue
+		}
+		if !m.interfaceExists(ctx, wan.Interface) {
+			logger.Warn("Multi-WAN: Skipping %s (%s) - interface does not exist", wan.Name, wan.Interface)
+			// Mark as unhealthy in status
+			m.mu.Lock()
+			if status, ok := m.status[wan.Interface]; ok {
+				status.Healthy = false
+				status.Up = false
+			}
+			m.mu.Unlock()
+			continue
+		}
+		activeWANs = append(activeWANs, wan)
+	}
 
-	// Ensure all WANs have DHCP running (for health monitoring)
-	for i := range wans {
-		wan := &wans[i]
-		if wan.Enabled && (wan.Mode == "dhcp" || wan.Mode == "wifi") {
+	if len(activeWANs) == 0 {
+		logger.Warn("Multi-WAN: No valid WAN interfaces found, failover disabled")
+		m.mu.Lock()
+		m.running = false
+		m.mu.Unlock()
+		return nil
+	}
+
+	logger.Info("Multi-WAN failover starting with %d WANs", len(activeWANs))
+
+	// Ensure all active WANs have DHCP running (for health monitoring)
+	for i := range activeWANs {
+		wan := &activeWANs[i]
+		if wan.Mode == "dhcp" || wan.Mode == "wifi" {
 			m.ensureDHCP(ctx, wan)
 		}
 	}
@@ -245,6 +279,21 @@ func (m *Manager) checkWAN(ctx context.Context, wan *config.WANConfig) {
 		m.status[wan.Interface] = status
 	}
 	m.mu.Unlock()
+
+	// Skip if interface doesn't exist (may have been removed)
+	if !m.interfaceExists(ctx, wan.Interface) {
+		m.mu.Lock()
+		if status.Up {
+			logger.Warn("Multi-WAN: %s interface disappeared", wan.Interface)
+		}
+		status.Up = false
+		status.Healthy = false
+		status.IPAddress = ""
+		status.Gateway = ""
+		status.LastCheck = time.Now()
+		m.mu.Unlock()
+		return
+	}
 
 	// Check link state
 	linkUp := m.checkLinkState(ctx, wan.Interface)
@@ -632,6 +681,12 @@ func (m *Manager) IsEnabled() bool {
 // ensureDHCP ensures an interface has a DHCP lease for health monitoring
 func (m *Manager) ensureDHCP(ctx context.Context, wan *config.WANConfig) {
 	iface := wan.Interface
+
+	// Check if interface exists first
+	if !m.interfaceExists(ctx, iface) {
+		logger.Debug("Multi-WAN: %s does not exist, skipping DHCP", iface)
+		return
+	}
 
 	// Check if interface already has an IP
 	out, err := m.runner.Run(ctx, "ip", "-4", "addr", "show", iface)
