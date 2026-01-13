@@ -11,6 +11,9 @@ import (
 	"github.com/iodesystems/ubuntu-router/internal/system"
 )
 
+// Pre-compiled regex patterns for parsing iw station dump output
+var bitrateRegex = regexp.MustCompile(`(\d+\.?\d*)\s*MBit`)
+
 // WiFiClientStats represents raw statistics for a WiFi client
 type WiFiClientStats struct {
 	MAC           string    `json:"mac"`
@@ -61,6 +64,7 @@ type WiFiClientManager struct {
 	runner      system.CommandRunner
 	history     map[string][]wifiClientSample // key: MAC address
 	historySize int
+	cachedRates []WiFiClientRates // cached rates from last Sample() call
 }
 
 // NewWiFiClientManager creates a new WiFi client stats manager
@@ -163,14 +167,12 @@ func parseStationDump(iface, output string) []WiFiClientStats {
 			// Could track average signal too if needed
 
 		case strings.HasPrefix(line, "rx bitrate:"):
-			re := regexp.MustCompile(`(\d+\.?\d*)\s*MBit`)
-			if matches := re.FindStringSubmatch(line); len(matches) >= 2 {
+			if matches := bitrateRegex.FindStringSubmatch(line); len(matches) >= 2 {
 				current.RxBitrate, _ = strconv.ParseFloat(matches[1], 64)
 			}
 
 		case strings.HasPrefix(line, "tx bitrate:"):
-			re := regexp.MustCompile(`(\d+\.?\d*)\s*MBit`)
-			if matches := re.FindStringSubmatch(line); len(matches) >= 2 {
+			if matches := bitrateRegex.FindStringSubmatch(line); len(matches) >= 2 {
 				current.TxBitrate, _ = strconv.ParseFloat(matches[1], 64)
 			}
 
@@ -237,7 +239,8 @@ func parseStationDump(iface, output string) []WiFiClientStats {
 	return stats
 }
 
-// Sample takes a snapshot of all WiFi client statistics and stores it
+// Sample takes a snapshot of all WiFi client statistics and stores it.
+// It also computes and caches rates to avoid duplicate iw calls.
 func (m *WiFiClientManager) Sample(ctx context.Context) error {
 	stats, err := m.GetAllClientStats(ctx)
 	if err != nil {
@@ -277,7 +280,61 @@ func (m *WiFiClientManager) Sample(ctx context.Context) error {
 		}
 	}
 
+	// Compute and cache rates from the stats we already have (no extra iw calls)
+	m.cachedRates = m.computeRatesLocked(stats)
+
 	return nil
+}
+
+// computeRatesLocked calculates rates for all clients. Must be called with lock held.
+func (m *WiFiClientManager) computeRatesLocked(currentStats []WiFiClientStats) []WiFiClientRates {
+	var rates []WiFiClientRates
+	for _, s := range currentStats {
+		samples := m.history[s.MAC]
+
+		rate := WiFiClientRates{
+			MAC:           s.MAC,
+			Interface:     s.Interface,
+			Timestamp:     s.Timestamp,
+			Signal:        s.Signal,
+			RxBitrate:     s.RxBitrate,
+			TxBitrate:     s.TxBitrate,
+			TotalRxBytes:  s.RxBytes,
+			TotalTxBytes:  s.TxBytes,
+			ConnectedTime: s.ConnectedTime,
+			Inactive:      s.Inactive,
+			Authorized:    s.Authorized,
+		}
+
+		if len(samples) >= 2 {
+			newest := samples[len(samples)-1]
+			oldest := samples[0]
+
+			duration := newest.timestamp.Sub(oldest.timestamp).Seconds()
+			if duration > 0 {
+				rate.RxBytesPerSec = float64(newest.stats.RxBytes-oldest.stats.RxBytes) / duration
+				rate.TxBytesPerSec = float64(newest.stats.TxBytes-oldest.stats.TxBytes) / duration
+			}
+		}
+
+		rates = append(rates, rate)
+	}
+	return rates
+}
+
+// GetCachedRates returns the rates computed during the last Sample() call.
+// This avoids duplicate calls to GetAllClientStats.
+func (m *WiFiClientManager) GetCachedRates() []WiFiClientRates {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Return a copy to avoid data races
+	if m.cachedRates == nil {
+		return nil
+	}
+	result := make([]WiFiClientRates, len(m.cachedRates))
+	copy(result, m.cachedRates)
+	return result
 }
 
 // GetClientRates calculates rates for a specific client

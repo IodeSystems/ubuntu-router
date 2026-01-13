@@ -275,8 +275,21 @@ func (s *Server) Run() error {
 		s.notifier.UpdateConnectedClients(ctx, clients)
 	})
 
-	// Start stats sampling in background
-	s.stats.StartSampling(ctx, stats.DefaultSampleInterval)
+	// Configure stats sampling intervals from config
+	idleInterval := stats.DefaultIdleSampleInterval
+	activeInterval := stats.DefaultActiveSampleInterval
+	if s.config.Stats != nil {
+		if s.config.Stats.IdleSampleInterval > 0 {
+			idleInterval = time.Duration(s.config.Stats.IdleSampleInterval) * time.Second
+		}
+		if s.config.Stats.ActiveSampleInterval > 0 {
+			activeInterval = time.Duration(s.config.Stats.ActiveSampleInterval) * time.Second
+		}
+	}
+	s.stats.SetSampleIntervals(idleInterval, activeInterval)
+
+	// Start stats sampling in background (starts in idle mode)
+	s.stats.StartSampling(ctx, idleInterval)
 
 	// Send system startup notification
 	go s.notifier.NotifySystemStartup(ctx)
@@ -490,6 +503,7 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("/api/stats/wifi/clients", s.requireAPIAuth(s.handleAPIStatsWiFiClients))
 	mux.HandleFunc("/api/stats/history", s.requireAPIAuth(s.handleAPIStatsHistory))
 	mux.HandleFunc("/api/stats/wifi-clients/history", s.requireAPIAuth(s.handleAPIStatsWiFiClientHistory))
+	mux.HandleFunc("/api/stats/sampling", s.requireAPIAuth(s.handleAPIStatsSampling))
 
 	// Devices
 	mux.HandleFunc("/api/devices", s.requireAPIAuth(s.handleAPIDevices))

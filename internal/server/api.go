@@ -4405,6 +4405,45 @@ func (s *Server) handleAPIStatsWiFiClientHistory(w http.ResponseWriter, r *http.
 	writeJSON(w, response)
 }
 
+// /api/stats/sampling - GET/POST stats sampling mode
+// GET returns current sampling status (active/idle mode and interval)
+// POST sets active mode (true = fast sampling for real-time UI, false = idle/slow sampling to save CPU)
+func (s *Server) handleAPIStatsSampling(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		// Return current sampling status
+		isActive := s.stats.IsActive()
+		interval := s.stats.GetSampleInterval()
+		writeJSON(w, map[string]interface{}{
+			"active":          isActive,
+			"interval_ms":     interval.Milliseconds(),
+			"interval_human":  interval.String(),
+		})
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		var req struct {
+			Active bool `json:"active"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		s.stats.SetActive(req.Active)
+
+		interval := s.stats.GetSampleInterval()
+		writeJSON(w, map[string]interface{}{
+			"active":          req.Active,
+			"interval_ms":     interval.Milliseconds(),
+			"interval_human":  interval.String(),
+		})
+		return
+	}
+
+	writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+}
+
 // /api/qos/status - GET QoS status
 func (s *Server) handleAPIQoSStatus(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.ctx(r)
