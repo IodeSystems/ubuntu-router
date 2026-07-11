@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Validate the repo without CI: catches build breaks (e.g. a dependency bump)
+# before code is merged/auto-merged.
+
+echo "==> go build ./..."
+go build ./...
+
+echo "==> go vet ./..."
+go vet ./...
+
+echo "==> make test"
+make test
